@@ -1,0 +1,21 @@
+# agent runtime artifacts — never commit these
+*.env
+agent.env
+.env
+.env.*
+*-events.jsonl
+*-cursor.txt
+
+# a filled-in prompt carries your channel IDs and internal scope; keep it local
+BOOTSTRAP-PROMPT.local.txt
+
+# test sandboxes
+standing-agent-test.*/
+__pycache__/
+*.pyc
+
+# editors / os
+.DS_Store
+*.swp
+.idea/
+.vscode/
