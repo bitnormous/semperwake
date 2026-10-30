@@ -190,19 +190,50 @@ less than no alert.
 
 ---
 
-## 5. Event sources are pluggable
+## 5. The producer contract
 
-The contract is one line of JSON appended to a file. That's it.
+**One line of normalized JSON, appended to a file.** That is the entire interface between the
+outside world and the agent.
 
 ```json
-{"ts":"2026-10-30T09:11:30Z","source":"events_api","event":{"channel":"D0…","user":"U0…","text":"deploy the hotfix, go"}}
+{
+  "ts": "2026-10-30T09:11:30Z",
+  "provider": "discord",
+  "kind": "message",
+  "channel": "1234567890",
+  "channel_type": "dm",
+  "user": "9876543210",
+  "text": "deploy the hotfix, go",
+  "thread": "",
+  "is_bot": false,
+  "mentions_self": false,
+  "raw": { }
+}
 ```
 
-Anything that appends can be a producer: a Slack listener, a GitHub webhook receiver, `cron`, a log
-tailer, a `curl` in a loop. The shipped Slack listener uses **Socket Mode**, which means no public
-URL, no inbound firewall rule, and no API quota consumed for receiving.
+| field | meaning |
+|---|---|
+| `provider` | free-form label; useful in logs, never branched on downstream |
+| `kind` | `message`, or `job` / `signal` for non-chat producers |
+| `channel_type` | **`dm`** or **`channel`** — normalize your platform's vocabulary into these two |
+| `user` | the author's platform id; compared against `OWNER_ID` and `SELF_BOT_ID` |
+| `thread` | what to reply into, if the platform threads |
+| `is_bot` | kept in `INCIDENT_CHANNELS`, dropped everywhere else |
+| `mentions_self` | computed by the listener, which is the only component that knows the platform's mention syntax |
+| `raw` | the original payload, for when the agent genuinely needs it |
 
-Two details in the listener matter:
+**Why normalize in the listener rather than in the filter?** Because mention syntax, DM detection and
+bot flags are the *only* genuinely platform-specific knowledge in the system. Push them into the one
+component that already speaks the platform, and the filter, the nudger, the watchdog and the prompt
+stay provider-agnostic forever. Adding Teams should not require touching four files.
+
+Producers need not be chat at all. A cron job emitting
+`{"kind":"job","job":"nightly-backup","prompt_file":"...","prompt_anchor":"..."}` gets tagged `[JOB]`
+and tells the agent to go execute a documented procedure.
+
+### Slack listener (Socket Mode)
+
+No public URL, no inbound firewall rule, no API quota for receiving. Two details matter:
 
 **Ack before processing.** Slack redelivers after ~3s without an ack, so acking after the disk write
 gives you duplicate events under load.
@@ -211,21 +242,46 @@ gives you duplicate events under load.
 if (m.envelope_id) ws.send(JSON.stringify({ envelope_id: m.envelope_id }))
 ```
 
-**`debug_reconnects=true`.** Slack recycles Socket Mode connections about every 30 minutes. This flag
+**`debug_reconnects=true`.** Slack recycles Socket Mode connections about every 30 minutes. The flag
 gets you a reconnect hint *before* the disconnect, closing the gap where events would be dropped.
+
+### Discord listener (Gateway)
+
+More protocol than Slack, and three parts are easy to get wrong:
+
+**The MESSAGE_CONTENT intent is privileged and off by default.** Without it every message arrives
+with an empty `content` field — the agent sees traffic it cannot read, which presents as a parsing
+bug rather than a permissions one. The listener requests
+`GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT`.
+
+**Heartbeats are mandatory.** Discord sends `op 10 HELLO` with a `heartbeat_interval`; miss the
+interval and the socket closes. The listener starts the heartbeat before identifying.
+
+**Resume beats reconnect.** `READY` carries a `session_id` and a `resume_gateway_url`; using them on
+reconnect replays missed events instead of dropping them. `op 9 INVALID_SESSION` means the resume
+was refused and a fresh identify is required.
+
+It also validates `SELF_BOT_ID` against the id Discord reports at `READY`, and warns on mismatch —
+otherwise mention detection and echo-dropping both silently do nothing, and the agent starts
+answering itself.
 
 ### The signal filter
 
 A busy queue is overwhelmingly noise. An agent that reads it raw concludes "all quiet" and misses the
 one message that mattered — so `signal-filter.py` is the only sanctioned read path. It:
 
-- tags each event: `[OWNER-DM]`, `[MENTION]`, `[OWNER-CHAN]`, `[INCIDENT]`
+- tags each event: `[OWNER-DM]`, `[MENTION]`, `[OWNER-CHAN]`, `[INCIDENT]`, `[JOB]`
 - drops the agent's own messages, or it answers itself forever
+- keeps bot traffic **only** in `INCIDENT_CHANNELS`, dropping it elsewhere
 - advances a byte-offset cursor (`--peek` to inspect without advancing)
-- treats `cursor > filesize` as rotation and re-reads from zero, instead of reporting a flat queue
+- treats `cursor > filesize` as rotation and re-reads from zero, rather than reporting a flat queue
 
 That last one is subtle and important: a truncated or rotated file makes a naive cursor read as
 "nothing new". **A metric that drops to exactly zero is a rotation suspect, not good news.**
+
+`[OWNER-CHAN]` deserves specific attention — it is the inbound path people forget exists. A
+production agent once ignored its owner's message in a shared ops channel for 55 minutes while
+posting into that very channel, because it was only watching the DM.
 
 ---
 
