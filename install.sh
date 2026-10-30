@@ -46,7 +46,7 @@ if [ -f "${ENV_FILE:-$SRC/.env}" ]; then
 fi
 
 # ─────────────────────────── CONFIG ───────────────────────────
-AGENT="${AGENT:-nova}"
+AGENT="${AGENT:-semp}"
 WORKSPACE="${WORKSPACE:-$HOME/$AGENT}"
 SESSION="${SESSION:-$AGENT}"
 STATE_DIR="${STATE_DIR:-/tmp/$AGENT-state}"

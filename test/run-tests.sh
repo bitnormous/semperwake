@@ -4,7 +4,7 @@
 # Stubs tmux, systemctl, loginctl, claude and curl, runs the installer into a
 # throwaway HOME, and asserts real behaviour. Touches NOTHING on your system:
 # no systemd units, no network, no tmux sessions, no files outside the sandbox.
-# Section 9 asserts that.
+# Section 10 asserts that.
 #
 #   ./test/run-tests.sh          run everything
 #   KEEP=1 ./test/run-tests.sh   keep the sandbox for inspection
@@ -91,6 +91,13 @@ ok "all config vars documented in .env.example"
 
 # ═════════════════════════ 2. tier 1 ═════════════════════════
 section "2. Tier 1 install (CHAT_PROVIDER=none)"
+HDEFAULT="$SANDBOX/default"; mkdir -p "$HDEFAULT"
+OUT="$(env -i HOME="$HDEFAULT" PATH="$STUB:/usr/local/bin:/usr/bin:/bin" \
+      WORKSPACE="$HDEFAULT/semp" STATE_DIR="$SANDBOX/state-semp" \
+      ENV_FILE=/nonexistent bash "$REPO/install.sh" 2>&1)"
+assert_contains "default installer completes" "$OUT" "Done."
+assert_file "default agent is semp" "$HDEFAULT/semp/agent.env"
+
 H1="$SANDBOX/h1"; mkdir -p "$H1"
 OUT="$(run_install "$H1" solo)"
 assert_contains "installer completes"  "$OUT" "Done."
