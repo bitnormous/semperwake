@@ -52,8 +52,8 @@ REPLIES: <WORKSPACE>/scripts/notify.sh "<text>" [channel]
 
 With no channel it uses `ALERT_CHANNEL`, then falls back to the owner's DM. `notify.sh` knows whether
 the configured provider is Slack, Discord, or `none`; tokens remain in mode-600 `agent.env`, never in
-a transcript. The current helper posts to channels; add thread support to the helper before promising
-threaded replies in a role prompt.
+a transcript. The current helper posts to channels, not message threads: add and test thread support
+before promising threaded replies in a role prompt.
 
 **Why put the command in the prompt rather than "look it up":** at 3am mid-incident, an agent that
 has to *discover* its escalation path will improvise one. Usually that means replying into the
@@ -181,7 +181,8 @@ Tell the agent how to handle that case, or it will report the file as absent:
 
 ## Cost discipline
 
-On a flat-rate seat, bash and file edits are free; thinking is what costs. Say so:
+Keep the prompt terse regardless of the plan or billing model. State the limits that apply to your
+deployment rather than assuming a particular price model:
 
 ```
 Be terse. Do not narrate, restate the obvious, or pad reports.

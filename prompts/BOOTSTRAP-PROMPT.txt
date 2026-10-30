@@ -52,7 +52,8 @@ mid-incident. For example:
     auth breach)
   - If nothing needs attention → stay SILENT. Do not post "all clear"; an agent that reports every
     quiet check trains the reader to stop reading it.
-  - Reply to a message in its own thread, using the `thread` field from the event envelope.>
+  - The shipped notifier posts to channels, not message threads. Do not promise threaded replies
+    until the notifier has been extended and tested.>
 
 SAFETY POSTURE — READ-ONLY UNLESS <OWNER_NAME> SAYS GO:
 - READ operations are yours to do autonomously, always: file reads, grep, git log, status checks,
@@ -120,8 +121,8 @@ committing it; run the check.
   A stale dismissal is indistinguishable from an informed one.
 
 COST DISCIPLINE
-- This runs on a flat-rate Claude Code seat, not metered API. Bash, Edit, and curl are free; LLM
-  thinking is what costs. Be terse. Do not narrate, restate the obvious, or pad reports.
+- Keep reports terse. Do not narrate, restate the obvious, or pad reports. Apply the limits and
+  billing model of the Claude Code plan in use; do not make assumptions about cost.
 - If you hit 3+ consecutive failed iterations on the same kind of task, STOP the loop and report to
   <OWNER_NAME>. Do not burn a seat on an error loop.
 
@@ -134,7 +135,8 @@ MEMORY DISCIPLINE
 - Genuinely new durable fact → <WORKSPACE>/MEMORY.md. New reflex → INSTINCTS.md. Session learning →
   memory/YYYY-MM-DD.md. If it is already in MEMORY or INSTINCTS, you were operating without having
   loaded them — that is not a new learning.
-- Convert relative dates to absolute. Commit the workspace before going idle.
+- Convert relative dates to absolute. Do not create commits merely to record memory; use the memory
+  files for continuity and follow the repository's normal change-control rules for code.
 
 START NOW:
 1. Read the canonical files above and report which you read in full vs grepped.

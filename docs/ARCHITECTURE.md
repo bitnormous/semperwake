@@ -90,7 +90,7 @@ Its sections, in the order they matter:
 |---|---|
 | **Canonical files** | What to read on every cold start to be the same agent it was yesterday |
 | **Event source** | The queue path, the cursor protocol, and an explicit ban on reading the queue raw |
-| **How you report** | The literal command to send a message, with real channel IDs inline — so it never improvises an escalation path mid-incident |
+| **How you report** | The installed `notify.sh` command and explicit routing rules — so it never improvises an escalation path mid-incident |
 | **Safety posture** | Read freely; three conditions for any write |
 | **Loop pacing** | What `.` means, how long to sleep, the per-iteration time cap |
 | **Measurement discipline** | The errors that make an agent *confidently wrong* |
@@ -217,7 +217,7 @@ outside world and the agent.
 | `kind` | `message`, or `job` / `signal` for non-chat producers |
 | `channel_type` | **`dm`** or **`channel`** — normalize your platform's vocabulary into these two |
 | `user` | the author's platform id; compared against `OWNER_ID` and `SELF_BOT_ID` |
-| `thread` | what to reply into, if the platform threads |
+| `thread` | an opaque reference to the inbound message or thread; retained for consumers that support replies |
 | `is_bot` | kept in `INCIDENT_CHANNELS`, dropped everywhere else |
 | `mentions_self` | computed by the listener, which is the only component that knows the platform's mention syntax |
 | `raw` | the original payload, for when the agent genuinely needs it |
@@ -233,7 +233,7 @@ and tells the agent to go execute a documented procedure.
 
 ### Slack listener (Socket Mode)
 
-No public URL, no inbound firewall rule, no API quota for receiving. Two details matter:
+No public URL or inbound firewall rule is required. Two details matter:
 
 **Ack before processing.** Slack redelivers after ~3s without an ack, so acking after the disk write
 gives you duplicate events under load.
@@ -287,9 +287,9 @@ posting into that very channel, because it was only watching the DM.
 
 ## Safety lives in the prompt
 
-With `--dangerously-skip-permissions`, the prompt is the only control. The gate is three conditions
-on every write — owner-verified origin, an explicit confirmation word, and a restatement of the
-action before execution — and authorisation never extends past the batch it was given for.
+With `--dangerously-skip-permissions`, the prompt defines the behavioural gate: owner-verified
+origin, an explicit confirmation word, and a restatement of the action before execution. It is not a
+security boundary and authorisation never extends past the batch it was given for.
 
 Structural protections worth adding around it:
 
@@ -303,10 +303,10 @@ Structural protections worth adding around it:
 
 ## Why not X?
 
-**Why not the Agent SDK / a headless harness?** Those are the right answer for request/response
+**Why not the Agent SDK / a headless harness?** Those are often the right answer for request/response
 work. This is for an agent that *persists* — one that remembers yesterday, holds a long-running
-investigation across wakes, and that you can attach to and talk with. Flat-rate seat pricing instead
-of metered API is the other half: a session that sleeps costs nothing.
+investigation across wakes, and that you can attach to and talk with. Choose the operating model and
+pricing that fit your Claude Code plan; this project makes no pricing guarantee.
 
 **Why not a cron job that calls `claude -p`?** No continuity. Every run starts cold, re-reads
 everything, and re-derives conclusions it reached an hour ago. The expensive part of an agent isn't

@@ -1,14 +1,14 @@
 # semperwake
 
-[![test](https://github.com/ovac/semperwake/actions/workflows/test.yml/badge.svg)](https://github.com/ovac/semperwake/actions/workflows/test.yml)
+[![test](https://github.com/bitnormous/semperwake/actions/workflows/test.yml/badge.svg)](https://github.com/bitnormous/semperwake/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Always awake.** Turn Claude Code into an autonomous agent that survives crashes, reboots, and your
 SSH session closing — and that wakes the instant someone messages it.
 
-No orchestration framework. No gateway. No second runtime. The only agent process is `claude` itself,
-running in a detached tmux session that systemd supervises, plus about 400 lines of shell that make
-it *reliable* rather than merely *running*.
+No orchestration framework. No gateway. No second agent runtime. Claude Code runs in a detached tmux
+session that systemd supervises; the installer adds the small pieces that make it *reliable* rather
+than merely *running*.
 
 ```
 claude  +  systemd  +  tmux  +  one very good prompt  =  an agent that works while you sleep
@@ -22,7 +22,7 @@ Every design decision here exists because its absence caused a specific, documen
 ## Quickstart
 
 ```bash
-git clone https://github.com/ovac/semperwake.git
+git clone https://github.com/bitnormous/semperwake.git
 cd semperwake
 
 # 0. PREREQUISITE — the one step a human must do. There is no headless path for it.
@@ -36,7 +36,7 @@ $EDITOR .env                  # set AGENT, and CHAT_PROVIDER if you want chat
 ./install.sh
 
 # 3. Fill in the brain, then arm it.
-$EDITOR ~/nova/BOOTSTRAP-PROMPT.txt     # replace every <PLACEHOLDER>
+$EDITOR "$HOME/nova/BOOTSTRAP-PROMPT.txt"  # replace every <PLACEHOLDER>
 nova-bootstrap
 ```
 
@@ -62,14 +62,15 @@ platform you use.
 
 | `CHAT_PROVIDER` | Status | How it connects |
 |---|---|---|
-| `none` | ✅ shipped | No chat at all. Agent self-paces. Zero extra dependencies. **Start here.** |
+| `none` | ✅ shipped | No chat integration. Agent self-paces. **Start here.** |
 | `slack` | ✅ shipped | Socket Mode — no public URL, no inbound firewall rule |
 | `discord` | ✅ shipped | Gateway WebSocket — same, plus auto-resume |
 | `teams` | 🚧 wanted | Needs an Azure app registration; [PRs welcome](CONTRIBUTING.md) |
 | `matrix` / `telegram` / `irc` | 🚧 wanted | Each is one small listener |
 
 Adding a platform means writing **one listener** that appends normalized JSON lines to the queue.
-Nothing else changes:
+The filter, nudger and watchdog do not need platform-specific changes. Add notification support to
+`notify.sh` too if the agent must send messages through that platform.
 
 ```json
 {"ts":"2026-10-30T09:11:30Z","provider":"discord","kind":"message",
@@ -114,8 +115,8 @@ Five parts. Each is independently replaceable.
 ```
 
 The `.` is a **wake signal, not a message.** The prompt tells the agent that any bare `.` means
-*drain your queue and take a turn*. That one trick is the difference between an agent that burns a
-token budget polling every 60 seconds and one that sleeps for free until something actually happens.
+*drain your queue and take a turn*. This avoids a fixed-interval polling loop and lets events wake the
+agent promptly.
 
 Full rationale: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
@@ -123,9 +124,9 @@ Full rationale: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 
 ## Safety — read this part
 
-`--dangerously-skip-permissions` is not optional here: no human is present to approve tool-call
-prompts. So **safety is enforced inside the prompt instead**, and the prompt's safety section is the
-*only* control on an agent with full tool access.
+`--dangerously-skip-permissions` is used because no human is present to approve tool-call prompts.
+The prompt supplies behavioural policy; it is not a security boundary. Run the agent as a dedicated,
+least-privileged Unix user and give its integrations scoped credentials.
 
 Every write action requires all three, every time:
 
@@ -208,7 +209,7 @@ Installs to:
 ~/<agent>/scripts/watchdog.sh     five liveness checks, every 2 min
 ~/<agent>/scripts/notify.sh       provider-agnostic "send a message"
 ~/<agent>/scripts/signal-filter.py   firehose → tagged signal
-~/<agent>/scripts/<provider>-listener.mjs
+~/<agent>/scripts/<provider>-listener.mjs  optional; installed only for Slack or Discord
 ~/.local/bin/<agent>-{bootstrap,attach}
 ~/.config/systemd/user/<agent>-*.{service,timer}
 ```
@@ -222,7 +223,7 @@ Installs to:
 ```
 
 90 assertions, hermetic. Stubs `tmux`, `systemctl`, `loginctl`, `claude` and `curl`, runs the
-installer into a throwaway `HOME`, and asserts real behaviour: all three provider tiers, `.env`
+installer into a throwaway `HOME`, and asserts real behaviour: the no-chat, Slack and Discord tiers, `.env`
 loading and precedence, signal-filter tagging across mixed providers, cursor semantics under
 rotation, nudge debounce under burst, notify routing per provider, and all five watchdog paths
 including alert dedupe. It never touches your systemd, your network, or your real agent — section 10
@@ -252,10 +253,15 @@ portable; `launchd` equivalents are welcome as a PR.
 
 ```bash
 systemctl --user disable --now nova-claude nova-nudger nova-listener nova-liveness.timer
-rm ~/.config/systemd/user/nova-*
+rm -f ~/.config/systemd/user/nova-*.service ~/.config/systemd/user/nova-*.timer
+rm -f ~/.local/bin/nova-bootstrap ~/.local/bin/nova-attach
 systemctl --user daemon-reload
-tmux kill-session -t nova
+tmux kill-session -t nova 2>/dev/null || true
 ```
+
+This stops the agent but deliberately keeps `$HOME/nova`, its memory, prompt and state. Remove that
+directory, its event/cursor files, and its state directory only after you have backed up anything you
+need. Substitute your configured `AGENT` value for `nova` throughout.
 
 ## Contributing
 
