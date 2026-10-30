@@ -25,9 +25,10 @@ check, a guard in the installer, a line in the prompt template.
 KEEP=1 ./test/run-tests.sh   # keep the sandbox to poke at
 ```
 
-The suite is hermetic: it stubs `tmux`, `systemctl`, `loginctl`, `claude`, `jq` and `curl`, installs
+The suite is hermetic: it stubs `tmux`, `systemctl`, `loginctl`, `claude` and `curl`, installs
 into a throwaway `HOME`, and asserts behaviour rather than output formatting. It will not touch your
-systemd units, your tmux sessions, your network, or your real agent. Section 8 asserts that.
+systemd units, your tmux sessions, your network, or your real agent. The hermeticity checks are in
+section 10.
 
 **Any behavioural change needs a test.** The whole premise of this repo is that silent failure is
 the enemy, so a change you cannot demonstrate is a change that might be doing nothing.
@@ -36,7 +37,8 @@ the enemy, so a change you cannot demonstrate is a change that might be doing no
 
 **Shell style.** `set -euo pipefail` (the watchdog deliberately drops `-e`, since it must survive a
 failing check and keep going). Quote everything. Prefer POSIX-ish bash over clever bash. No
-dependencies beyond coreutils, `tmux`, `python3` — plus `node`/`jq` for the optional Slack source.
+dependencies beyond coreutils, `tmux`, `python3` — plus `node` for the optional Slack or Discord
+listeners.
 
 **Comment the *why*, not the *what*.** The codebase is deliberately heavy on comments explaining why
 a line exists, because most lines exist to prevent a specific failure that isn't obvious from
@@ -66,8 +68,9 @@ is solving a different problem — and probably one of the problems this repo ex
 
 - **`launchd` support** so this works on macOS. The tmux + prompt + nudge core is already portable;
   only the unit files and `loginctl` are Linux-specific.
-- **More event producers**: GitHub webhooks, Discord, Matrix, email, a log tailer, a webhook sink.
-  One file, appends JSON lines, ships with its own `signal-filter` variant.
+- **More event producers**: GitHub webhooks, Matrix, email, a log tailer, a webhook sink. One file
+  appends normalized JSON lines; the existing signal filter handles it unchanged. If the provider
+  must also carry outbound messages, add and test its `notify.sh` path.
 - **A prompt library** — `prompts/` variants for different agent roles (SRE, release manager,
   on-call triage, research assistant) with the safety section intact.
 - **Multi-agent examples**: two or three agents with disjoint scopes that name each other's

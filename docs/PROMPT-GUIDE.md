@@ -15,7 +15,7 @@ fill them in without defeating the point.
 | `<WORKSPACE>`, `<EVENT_JSONL>`, `<CURSOR_FILE>`, `<SESSION>` | Substituted by the installer |
 | `<OWNER_NAME>` | The one human who may authorise writes. A name, not a role. |
 | `<ONE PARAGRAPH: your role…>` | Identity and scope — **and explicitly what is not yours** |
-| `<FILL IN: the exact command…>` | How to report. Literal command, real IDs, inline. |
+| `<FILL IN: your routing rules…>` | Where reports should go and when the agent must stay silent. |
 | `<FILL IN: your own hard laws>` | The rules specific to your stack |
 
 ---
@@ -41,22 +41,23 @@ owner for the other side of it stays put.
 If you run more than one agent, each prompt should name the others and their scopes. It's how they
 stop stepping on each other without any coordination mechanism.
 
-## Reporting: put the literal command in the prompt
+## Reporting: one command, explicit routes
 
-Don't describe the capability; paste the command, with real IDs:
+The installer ships a provider-neutral command. Keep it in the prompt instead of reproducing a
+provider API or putting credentials into the prompt:
 
 ```
-REPLIES: send via the bot token from <WORKSPACE>/.env. Pattern:
-  BOT=$(grep '^SLACK_BOT_TOKEN=' <WORKSPACE>/.env | cut -d= -f2)
-  curl -s -X POST https://slack.com/api/chat.postMessage \
-    -H "Authorization: Bearer $BOT" -H "Content-Type: application/json; charset=utf-8" \
-    -d '{"channel":"<ID>","text":"<text>","thread_ts":"<optional>"}'
-Channels: #sre = CXXXXXXXXXX, #alerts = CYYYYYYYYYY, owner DM = DZZZZZZZZZZ.
+REPLIES: <WORKSPACE>/scripts/notify.sh "<text>" [channel]
 ```
 
-**Why inline rather than "look it up":** at 3am mid-incident, an agent that has to *discover* its own
-escalation path will improvise one. Usually that means replying into the session — which goes
-nowhere, because nobody is attached.
+With no channel it uses `ALERT_CHANNEL`, then falls back to the owner's DM. `notify.sh` knows whether
+the configured provider is Slack, Discord, or `none`; tokens remain in mode-600 `agent.env`, never in
+a transcript. The current helper posts to channels, not message threads: add and test thread support
+before promising threaded replies in a role prompt.
+
+**Why put the command in the prompt rather than "look it up":** at 3am mid-incident, an agent that
+has to *discover* its escalation path will improvise one. Usually that means replying into the
+session — which goes nowhere, because nobody is attached.
 
 Also specify routing explicitly, including the silent case:
 
@@ -180,7 +181,8 @@ Tell the agent how to handle that case, or it will report the file as absent:
 
 ## Cost discipline
 
-On a flat-rate seat, bash and file edits are free; thinking is what costs. Say so:
+Keep the prompt terse regardless of the plan or billing model. State the limits that apply to your
+deployment rather than assuming a particular price model:
 
 ```
 Be terse. Do not narrate, restate the obvious, or pad reports.
