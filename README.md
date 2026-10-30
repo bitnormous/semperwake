@@ -36,20 +36,20 @@ $EDITOR .env                  # set AGENT, and CHAT_PROVIDER if you want chat
 ./install.sh
 
 # 3. Fill in the brain, then arm it.
-$EDITOR "$HOME/nova/BOOTSTRAP-PROMPT.txt"  # replace every <PLACEHOLDER>
-nova-bootstrap
+$EDITOR "$HOME/semp/BOOTSTRAP-PROMPT.txt"  # replace every <PLACEHOLDER>
+semp-bootstrap
 ```
 
 That's a self-healing agent that paces itself with `ScheduleWakeup`. Everything is named after your
-`AGENT` value — `nova` above.
+`AGENT` value — `semp` above.
 
 ### Daily driving
 
 ```bash
-nova-attach status     # what's up, and which provider
-nova-attach            # watch it think, live (detach: Ctrl-B then d)
-nova-attach logs       # follow the journal
-nova-bootstrap         # re-arm the loop by hand
+semp-attach status     # what's up, and which provider
+semp-attach            # watch it think, live (detach: Ctrl-B then d)
+semp-attach logs       # follow the journal
+semp-bootstrap         # re-arm the loop by hand
 ```
 
 ---
@@ -252,16 +252,16 @@ portable; `launchd` equivalents are welcome as a PR.
 ## Teardown
 
 ```bash
-systemctl --user disable --now nova-claude nova-nudger nova-listener nova-liveness.timer
-rm -f ~/.config/systemd/user/nova-*.service ~/.config/systemd/user/nova-*.timer
-rm -f ~/.local/bin/nova-bootstrap ~/.local/bin/nova-attach
+systemctl --user disable --now semp-claude semp-nudger semp-listener semp-liveness.timer
+rm -f ~/.config/systemd/user/semp-*.service ~/.config/systemd/user/semp-*.timer
+rm -f ~/.local/bin/semp-bootstrap ~/.local/bin/semp-attach
 systemctl --user daemon-reload
-tmux kill-session -t nova 2>/dev/null || true
+tmux kill-session -t semp 2>/dev/null || true
 ```
 
-This stops the agent but deliberately keeps `$HOME/nova`, its memory, prompt and state. Remove that
+This stops the agent but deliberately keeps `$HOME/semp`, its memory, prompt and state. Remove that
 directory, its event/cursor files, and its state directory only after you have backed up anything you
-need. Substitute your configured `AGENT` value for `nova` throughout.
+need. Substitute your configured `AGENT` value for `semp` throughout.
 
 ## Contributing
 
