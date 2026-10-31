@@ -4,7 +4,7 @@
 # Stubs tmux, systemctl, loginctl, claude and curl, runs the installer into a
 # throwaway HOME, and asserts real behaviour. Touches NOTHING on your system:
 # no systemd units, no network, no tmux sessions, no files outside the sandbox.
-# Section 10 asserts that.
+# Section 12 asserts that.
 #
 #   ./test/run-tests.sh          run everything
 #   KEEP=1 ./test/run-tests.sh   keep the sandbox for inspection
@@ -35,7 +35,9 @@ mkdir -p "$STUB"
 cat > "$STUB/tmux" <<'EOF'
 #!/bin/bash
 case "$1" in
-  has-session)   exit 0 ;;
+  has-session)   [ -z "${FAKE_NO_SESSION:-}" ] ;;
+  kill-session)  echo "kill-session" >> "${TMUX_LOG:-/dev/null}" ;;
+  display-message) echo "${FAKE_SESSION_CREATED:-}" ;;
   capture-pane)  printf '%s' "${FAKE_PANE:-agent loop queue cursor idle}" ;;
   send-keys)     echo "${*:4}" >> "${SENDKEYS_LOG:?}" ;;
   list-clients)  [ -n "${FAKE_ATTACHED:-}" ] && echo client ; exit 0 ;;
@@ -50,6 +52,7 @@ echo "$*" >> "${SYSTEMCTL_LOG:-/dev/null}"
 exit 0
 EOF
 printf '#!/bin/bash\nexit 0\n' > "$STUB/loginctl"
+printf '#!/bin/bash\necho "AGENT=${AGENT:-} $*" >> "${DOCKER_LOG:-/dev/null}"\n' > "$STUB/docker"
 printf '#!/bin/bash\nexit 0\n' > "$STUB/claude"
 # curl must never reach the network. Record the call, return a plausible body
 # for both providers' DM-resolution endpoints.
@@ -128,6 +131,7 @@ python3 -m py_compile "$H1/solo/scripts/signal-filter.py" 2>/dev/null \
 P="$H1/solo/BOOTSTRAP-PROMPT.txt"
 assert_eq "installer placeholders substituted" \
   "$(grep -c '<WORKSPACE>\|<AGENT_NAME>\|<EVENT_JSONL>\|<CURSOR_FILE>\|<SESSION>' "$P")" "0"
+grep -q 'solo/IDENTITY.md' "$P" && ok "prompt reads the agent's profile" || bad "prompt reads the agent's profile"
 grep -q '<OWNER_NAME>' "$P" && ok "human-fill placeholders preserved" || bad "human-fill placeholders preserved"
 grep -q hasTrustDialogAccepted "$H1/.claude.json" && ok "workspace pre-trusted" || bad "workspace pre-trusted"
 assert_eq "agent.env is mode 600" "$(stat -c '%a' "$H1/solo/agent.env")" "600"
@@ -320,14 +324,178 @@ wd 'nova loop idle, next wake 600s' >/dev/null
 assert_lacks "default threshold spares a sleeping agent" \
   "$(wd 'nova loop idle, next wake 600s')" "frozen"
 
+# A booting session has no loop markers yet, and the runner is about to paste.
+rm -rf "$SANDBOX/state-nova/watchdog"
+assert_lacks "booting session is not re-armed" \
+  "$(FAKE_SESSION_CREATED="$(date +%s)" wd 'Welcome to Claude Code  >')" "re-armed"
+
+# A logged-out claude has no error text, only a picker. Re-arming pastes the prompt
+# into the login flow and logs "ok" forever, so these must alert instead.
+for pane in 'Select login method:' 'Paste code here if prompted >'; do
+  rm -rf "$SANDBOX/state-nova/watchdog"
+  R="$(wd "$pane")"
+  assert_contains "login screen alerts: $pane" "$R" "ALERT[login-expired]"
+  assert_lacks "login screen is not re-armed: $pane" "$R" "re-armed"
+done
+rm -rf "$SANDBOX/state-nova/watchdog"
+R="$(wd 'Bypass Permissions mode  No, exit  Yes, I accept')"
+assert_contains "bypass warning alerts" "$R" "ALERT[bypass-unaccepted]"
+assert_lacks "bypass warning is not re-armed" "$R" "re-armed"
+
 # alert dedupe: the same fault twice in a row must page once
 rm -rf "$SANDBOX/state-nova/watchdog"
 wd 'Invalid API key · Please run /login' >/dev/null
 assert_contains "repeat alert is deduped" \
   "$(wd 'Invalid API key · Please run /login')" "deduped"
 
-# ═════════════════════════ 10. hermeticity ═════════════════════════
-section "10. Hermeticity"
+# ═════════════════════════ 10. container supervision ═════════════════════════
+section "10. Container supervision (SUPERVISOR=container)"
+bash -n "$REPO/docker/entrypoint.sh" && ok "entrypoint.sh parses" || bad "entrypoint.sh parses"
+assert_file "Dockerfile shipped"       "$REPO/Dockerfile"
+assert_file "compose.yaml shipped"     "$REPO/compose.yaml"
+grep -qx '\*' "$REPO/.dockerignore" && ! grep -q '^!\.env' "$REPO/.dockerignore" \
+  && ok ".env cannot enter the image" || bad ".env cannot enter the image"
+
+grep -q '^/agents/\*$' "$REPO/.gitignore" && ok "agent directories are private by default" \
+  || bad "agent directories are private by default"
+assert_file "example agent profile shipped" "$REPO/agents/example/IDENTITY.md"
+COMPOSE="$(cat "$REPO/compose.yaml")"
+assert_contains "each agent mounts its own directory" "$COMPOSE" './agents/${AGENT:-semp}:/workspace'
+assert_contains "each agent gets its own project"     "$COMPOSE" 'name: semperwake-${AGENT:-semp}'
+assert_contains "per-agent settings are loaded"       "$COMPOSE" 'path: agents/${AGENT:-semp}/.env'
+assert_contains "the mounted agent is the one named"  "$COMPOSE" 'AGENT: ${AGENT:-semp}'
+
+HC="$SANDBOX/hc"; mkdir -p "$HC"
+SCL="$SANDBOX/container-sc.log"; TL="$SANDBOX/container-tmux.log"; : > "$SCL"; : > "$TL"
+OUT="$(run_install "$HC" box SUPERVISOR=container SYSTEMCTL_LOG="$SCL")"
+assert_contains "container install completes" "$OUT" "installed for container supervision"
+assert_contains "agent.env records the supervisor" "$(cat "$HC/box/agent.env")" "SUPERVISOR=container"
+assert_file "scripts still generated"  "$HC/box/scripts/watchdog.sh"
+assert_nofile "NO systemd units"       "$HC/.config/systemd/user/box-claude.service"
+assert_lacks "linger not attempted"    "$OUT" "enabling linger"
+assert_eq "systemctl never called"     "$(wc -l < "$SCL" | tr -d ' ')" "0"
+OUT="$(run_install "$SANDBOX/hcb" bad SUPERVISOR=launchd 2>&1 || true)"
+assert_contains "unknown supervisor rejected" "$OUT" "SUPERVISOR must be one of"
+
+# Without a session the watchdog must restart by killing it: there is no unit to
+# restart, and calling systemctl here would fail every time without saying why.
+R="$(env AGENT_ENV="$HC/box/agent.env" FAKE_NO_SESSION=1 PATH="$STUB:$PATH" \
+       SYSTEMCTL_LOG="$SCL" TMUX_LOG="$TL" bash "$HC/box/scripts/watchdog.sh" 2>&1)"
+assert_contains "watchdog restarts the session" "$R" "restarting"
+assert_eq "restart goes through tmux"  "$(grep -c '^kill-session$' "$TL")" "1"
+assert_eq "watchdog never calls systemctl" "$(wc -l < "$SCL" | tr -d ' ')" "0"
+assert_contains "attach logs points at docker" \
+  "$(env PATH="$STUB:$PATH" bash "$HC/.local/bin/box-attach" logs 2>&1)" "docker compose logs"
+
+# Enter on the bypass warning selects "No, exit", so pasting there kills claude.
+BL="$SANDBOX/run.out"
+env AGENT_ENV="$HC/box/agent.env" BOOTSTRAP_DELAY_SECS=0 FAKE_PANE='No, exit  Yes, I accept' \
+    PATH="$STUB:$PATH" setsid bash "$HC/box/scripts/run.sh" > "$BL" 2>&1 &
+RP=$!; sleep 1; kill -TERM -- "-$RP" 2>/dev/null; wait "$RP" 2>/dev/null
+assert_contains "no auto-paste onto a human-only screen" "$(cat "$BL")" "skipping auto-bootstrap"
+assert_lacks "prompt not loaded onto a human-only screen" "$(cat "$BL")" "loop prompt loaded"
+
+entry() { # entry <out> — start the entrypoint in its own process group
+  env -i HOME="$HC" PATH="$STUB:/usr/local/bin:/usr/bin:/bin" AGENT=box WORKSPACE="$HC/box" \
+      STATE_DIR="$SANDBOX/state-box" ENV_FILE=/nonexistent SUPERVISOR=container \
+      PROMPT_POLL_SECS=1 WATCHDOG_BOOT_SECS=600 SENDKEYS_LOG="$SK" \
+      setsid bash "$REPO/docker/entrypoint.sh" > "$1" 2>&1 &
+  EP=$!
+}
+stop_entry() { kill -TERM -- "-$EP" 2>/dev/null; wait "$EP" 2>/dev/null; }
+
+entry "$SANDBOX/ep1.out"; sleep 2
+assert_contains "unfilled prompt holds the agent" "$(cat "$SANDBOX/ep1.out")" "waiting: fill in"
+assert_lacks "claude not started on an unfilled prompt" "$(cat "$SANDBOX/ep1.out")" "starting detached tmux"
+sed -i 's/<OWNER_NAME>/Owner/g; /<ONE PARAGRAPH/,/>$/d; /<FILL IN/,/>$/d' "$HC/box/BOOTSTRAP-PROMPT.txt"
+sleep 2
+assert_contains "filling the prompt starts the agent" "$(cat "$SANDBOX/ep1.out")" "starting detached tmux"
+stop_entry
+
+env -i HOME="$HC" PATH="$STUB:/usr/local/bin:/usr/bin:/bin" bash "$REPO/docker/entrypoint.sh" echo passed-through > "$SANDBOX/ep2.out" 2>&1
+assert_eq "explicit command runs instead of the agent" "$(cat "$SANDBOX/ep2.out")" "passed-through"
+
+# ═════════════════════════ 11. the semperwake command ═════════════════════════
+section "11. The semperwake command"
+bash -n "$REPO/semperwake" && ok "semperwake parses" || bad "semperwake parses"
+# A copy, because `new` writes under its own agents/ directory.
+CLI="$SANDBOX/cli"; mkdir -p "$CLI/agents"
+cp -R "$REPO/agents/example" "$CLI/agents/example"
+cp -R "$REPO/prompts" "$REPO/compose.yaml" "$REPO/semperwake" "$CLI/"
+DL="$SANDBOX/docker.log"; : > "$DL"
+sw() { env PATH="$STUB:$PATH" DOCKER_LOG="$DL" bash "$CLI/semperwake" "$@" 2>&1; }
+fill() { sed -i '/<ONE PARAGRAPH/,/>$/d; /<FILL IN/,/>$/d; s/<OWNER_NAME>/Owner/g' "$1"; }
+
+assert_contains "new creates an agent" "$(sw new alpha --owner 'Ada Lovelace')" "agents/alpha is ready"
+for f in IDENTITY.md SOUL.md MEMORY.md INSTINCTS.md HEARTBEAT.md JOBS.md BOOTSTRAP-PROMPT.txt .env; do
+  assert_file "new adds $f" "$CLI/agents/alpha/$f"
+done
+assert_contains "identity carries the agent's name" "$(cat "$CLI/agents/alpha/IDENTITY.md")" "**Name:** alpha"
+P="$(cat "$CLI/agents/alpha/BOOTSTRAP-PROMPT.txt")"
+assert_contains "prompt carries the owner"  "$P" "Only Ada Lovelace directs you"
+assert_lacks "prompt paths are substituted" "$P" "<WORKSPACE>"
+assert_eq "agent .env is mode 600" "$(stat -c '%a' "$CLI/agents/alpha/.env")" "600"
+assert_lacks "no chat settings without a provider" "$(cat "$CLI/agents/alpha/.env")" "OWNER_ID"
+
+for name in Bad.Name ../escape UPPER -dash example; do
+  assert_contains "new rejects '$name'" "$(sw new "$name")" "error:"
+done
+assert_eq "rejected names create nothing" "$(ls "$CLI/agents" | tr '\n' ' ')" "alpha example "
+
+echo "MY EDIT" >> "$CLI/agents/alpha/SOUL.md"
+rm "$CLI/agents/alpha/JOBS.md"
+sw new alpha >/dev/null
+assert_contains "new keeps existing edits" "$(cat "$CLI/agents/alpha/SOUL.md")" "MY EDIT"
+assert_file "new restores what is missing" "$CLI/agents/alpha/JOBS.md"
+
+R="$(sw check alpha)"
+assert_contains "check finds unfilled placeholders" "$R" "still has placeholders on lines"
+assert_contains "check reports the count"           "$R" "problem(s) to fix"
+: > "$DL"
+assert_contains "up refuses a failing agent" "$(sw up alpha)" "problem(s) to fix"
+assert_lacks "nothing starts on a failed check" "$(cat "$DL")" "up -d"
+fill "$CLI/agents/alpha/BOOTSTRAP-PROMPT.txt"
+assert_contains "check passes a complete agent" "$(sw check alpha)" "alpha is ready."
+: > "$DL"; sw up alpha >/dev/null
+L="$(cat "$DL")"
+assert_contains "up starts the named agent" "$L" "AGENT=alpha compose"
+assert_contains "up runs detached"          "$L" "up -d"
+
+sw new bravo --owner Owner --provider discord >/dev/null
+fill "$CLI/agents/bravo/BOOTSTRAP-PROMPT.txt"
+assert_contains "provider settings are scaffolded" "$(cat "$CLI/agents/bravo/.env")" "DISCORD_BOT_TOKEN="
+R="$(sw check bravo)"
+assert_contains "check wants the owner"   "$R" "FAIL  OWNER_ID is empty"
+assert_contains "check wants the token"   "$R" "FAIL  DISCORD_BOT_TOKEN is empty"
+sed -i 's/^OWNER_ID=.*/OWNER_ID=1234/; s/^DISCORD_BOT_TOKEN=.*/DISCORD_BOT_TOKEN=secret-token-value/' "$CLI/agents/bravo/.env"
+R="$(sw check bravo)"
+assert_contains "a missing self id only warns" "$R" "warn  SELF_BOT_ID is empty"
+assert_lacks "check never prints a secret"     "$R" "secret-token-value"
+assert_contains "the shared .env counts too" \
+  "$(printf 'SLACK_APP_TOKEN=wrong\n' > "$CLI/.env"; sw new carol --provider slack >/dev/null; sed -i '/^SLACK_APP_TOKEN=/d' "$CLI/agents/carol/.env"; sw check carol)" \
+  "FAIL  SLACK_APP_TOKEN should start with xapp-"
+rm -f "$CLI/.env"
+
+: > "$DL"
+assert_contains "an unknown agent is explained" "$(sw up nobody)" "./semperwake new nobody"
+assert_eq "an unknown agent reaches no docker command" "$(wc -l < "$DL" | tr -d ' ')" "0"
+
+printf 'services:\n  agent: {}\n' > "$CLI/agents/alpha/compose.yaml"
+: > "$DL"; sw down alpha >/dev/null
+assert_contains "an agent's compose.yaml is included" "$(cat "$DL")" "agents/alpha/compose.yaml"
+rm "$CLI/agents/alpha/compose.yaml"
+: > "$DL"; sw restart alpha >/dev/null
+assert_contains "restart applies .env and mount changes" "$(cat "$DL")" "up -d --force-recreate"
+
+: > "$DL"; sw job alpha daily-summary >/dev/null
+assert_contains "job queues a normalized event" "$(cat "$DL")" '"kind":"job","job":"daily-summary"'
+assert_contains "job rejects unsafe names" "$(sw job alpha 'x"; rm -rf /')" "usage:"
+L="$(sw list)"
+assert_contains "list shows agents"   "$L" "alpha"
+assert_lacks "list hides the template" "$L" "example"
+
+# ═════════════════════════ 12. hermeticity ═════════════════════════
+section "12. Hermeticity"
 assert_eq "no units written to the real \$HOME" \
   "$(ls "$HOME/.config/systemd/user/"{solo,nova,disc,envagent}-* 2>/dev/null | wc -l)" "0"
 assert_eq "no agent state outside the sandbox" \

@@ -1,0 +1,254 @@
+#!/bin/bash
+# semperwake — create, check and run the agents in agents/<name> with Docker.
+#
+# This only drives `docker compose`: nothing here runs while an agent runs, so an
+# agent never depends on it. Written for the bash 3.2 that macOS ships.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENTS="$ROOT/agents"
+PLACEHOLDERS='<(OWNER_NAME|FILL IN|ONE PARAGRAPH)'
+
+die() { echo "error: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+
+usage() {
+  cat <<EOF
+usage: ./semperwake <command> [agent]
+
+  new <name> [--owner NAME] [--provider none|slack|discord]
+                     create agents/<name>, or add what an existing folder is missing
+  check <name>       find what would stop this agent working
+  login <name>       log in to Claude and accept the permissions warning, once
+  up <name>          check the agent, then start it
+  down <name>        stop it, keeping its login and memory
+  restart <name>     restart it, applying any .env or compose.yaml changes
+  status <name>      show whether it is running and healthy
+  attach <name>      watch it think (detach: Ctrl-B then d)
+  logs <name>        follow its logs and watchdog alerts
+  job <name> <job>   run a section of its JOBS.md now
+  list               show every agent
+EOF
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+need_agent() { # need_agent <name> — every command but `new` runs on an existing agent
+  [ -n "${1:-}" ] || { usage >&2; exit 1; }
+  valid_name "$1" || die "'$1' is not a valid agent name"
+  [ -d "$AGENTS/$1" ] || die "no agent '$1'. Create it with: ./semperwake new $1"
+}
+
+compose() { # compose <name> <args...> — adds the agent's own compose.yaml if it has one
+  local name="$1" files=(-f "$ROOT/compose.yaml"); shift
+  [ ! -f "$AGENTS/$name/compose.yaml" ] || files+=(-f "$AGENTS/$name/compose.yaml")
+  AGENT="$name" docker compose --project-directory "$ROOT" "${files[@]}" "$@"
+}
+
+cfg() { # cfg <name> <key> — same precedence as compose: the agent's .env, then the shared one
+  local file value
+  for file in "$AGENTS/$1/.env" "$ROOT/.env"; do
+    [ -f "$file" ] && grep -q "^$2=" "$file" || continue
+    value="$(sed -n "s/^$2=//p" "$file" | tail -n 1)"
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    printf '%s' "$value"
+    return 0
+  done
+}
+
+write_env() { # write_env <file> <provider> — only the settings this provider needs
+  (
+    umask 077
+    {
+      echo "# Settings for this agent only. See .env.example for every option."
+      echo "CHAT_PROVIDER=$2"
+      if [ "$2" != none ]; then
+        echo "OWNER_ID="
+        echo "SELF_BOT_ID="
+        echo "OWNER_CHANNELS="
+        echo "INCIDENT_CHANNELS="
+      fi
+      case "$2" in
+        slack)   echo "SLACK_APP_TOKEN="; echo "SLACK_BOT_TOKEN=" ;;
+        discord) echo "DISCORD_BOT_TOKEN=" ;;
+      esac
+    } > "$1"
+  )
+}
+
+cmd_new() {
+  local name="${1:-}" owner="" provider=none file dir added=0
+  [ -n "$name" ] || { usage >&2; exit 1; }
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --owner)    [ "$#" -ge 2 ] || die "--owner needs a value"; owner="$2"; shift 2 ;;
+      --provider) [ "$#" -ge 2 ] || die "--provider needs a value"; provider="$2"; shift 2 ;;
+      *) die "unknown option '$1'" ;;
+    esac
+  done
+  valid_name "$name" || die "'$name' is not valid: use lowercase letters, digits and hyphens"
+  [ "$name" != example ] || die "'example' is the template. Choose another name"
+  case "$owner" in *'|'*|*'&'*|*'\'*) die "--owner cannot contain | & or \\" ;; esac
+  case "$provider" in none|slack|discord) ;; *) die "--provider must be none, slack or discord" ;; esac
+
+  dir="$AGENTS/$name"
+  mkdir -p "$dir/memory"
+  # Existing files are never replaced, so this is also how a folder you already
+  # have joins: it gains what is missing and keeps every edit.
+  for file in "$AGENTS"/example/*.md; do
+    [ -e "$dir/$(basename "$file")" ] && continue
+    cp "$file" "$dir/"
+    added=$((added + 1))
+  done
+  if grep -q '^- \*\*Name:\*\* Example$' "$dir/IDENTITY.md"; then
+    sed -i.bak "s/^- \*\*Name:\*\* Example$/- **Name:** $name/" "$dir/IDENTITY.md" && rm -f "$dir/IDENTITY.md.bak"
+  fi
+  if [ ! -e "$dir/BOOTSTRAP-PROMPT.txt" ]; then
+    sed -e "s|<AGENT_NAME>|$name|g" -e "s|<WORKSPACE>|/workspace|g" \
+        -e "s|<EVENT_JSONL>|/workspace/.run/events.jsonl|g" \
+        -e "s|<CURSOR_FILE>|/workspace/.run/cursor.txt|g" -e "s|<SESSION>|$name|g" \
+        -e "${owner:+s|<OWNER_NAME>|$owner|g}" \
+        "$ROOT/prompts/BOOTSTRAP-PROMPT.txt" > "$dir/BOOTSTRAP-PROMPT.txt"
+    added=$((added + 1))
+  fi
+  if [ ! -e "$dir/.env" ]; then
+    write_env "$dir/.env" "$provider"
+    added=$((added + 1))
+  fi
+
+  say "agents/$name is ready ($added files added)"
+  cat <<EOF
+
+Next:
+  1. Describe your agent in agents/$name/IDENTITY.md and SOUL.md
+  2. Fill in agents/$name/BOOTSTRAP-PROMPT.txt and agents/$name/.env
+  3. ./semperwake check $name
+  4. ./semperwake login $name
+  5. ./semperwake up $name
+EOF
+}
+
+# check prints every problem at once, so fixing an agent never takes one run per fault.
+PROBLEMS=0
+pass() { echo "  ok    $*"; }
+warn() { echo "  warn  $*"; }
+fail() { echo "  FAIL  $*"; PROBLEMS=$((PROBLEMS + 1)); }
+
+need_value() { # need_value <name> <key> [required prefix]
+  local value; value="$(cfg "$1" "$2")"
+  if [ -z "$value" ]; then fail "$2 is empty"
+  elif [ -n "${3:-}" ] && [ "${value#"$3"}" = "$value" ]; then fail "$2 should start with $3"
+  else pass "$2 is set"; fi
+}
+
+cmd_check() {
+  local name="$1" dir="$AGENTS/$1" prompt provider rc=0 lines
+  prompt="$dir/BOOTSTRAP-PROMPT.txt"
+  PROBLEMS=0
+  say "checking $name"
+
+  if [ ! -f "$prompt" ]; then
+    fail "no BOOTSTRAP-PROMPT.txt. Run: ./semperwake new $name"
+  elif lines="$(grep -nE "$PLACEHOLDERS" "$prompt" | cut -d: -f1 | paste -sd, -)" && [ -n "$lines" ]; then
+    fail "BOOTSTRAP-PROMPT.txt still has placeholders on lines: $lines"
+  else
+    pass "prompt is filled in"
+  fi
+
+  provider="$(cfg "$name" CHAT_PROVIDER)"; provider="${provider:-none}"
+  case "$provider" in
+    none) pass "no chat provider: the agent paces itself and reports to a log" ;;
+    slack|discord)
+      need_value "$name" OWNER_ID
+      if [ "$provider" = slack ]; then
+        need_value "$name" SLACK_APP_TOKEN xapp-
+        need_value "$name" SLACK_BOT_TOKEN xoxb-
+      else
+        need_value "$name" DISCORD_BOT_TOKEN
+      fi
+      [ -n "$(cfg "$name" SELF_BOT_ID)" ] \
+        && pass "SELF_BOT_ID is set" \
+        || warn "SELF_BOT_ID is empty: the agent can read its own messages as new input"
+      ;;
+    *) fail "CHAT_PROVIDER must be none, slack or discord (got '$provider')" ;;
+  esac
+
+  if ! docker info >/dev/null 2>&1; then
+    fail "Docker is not running"
+  elif ! docker image inspect semperwake:local >/dev/null 2>&1; then
+    warn "image not built yet: 'up' or 'login' builds it, which takes several minutes"
+  else
+    pass "Docker is running and the image is built"
+    compose "$name" run --rm -T agent sh -c '
+      [ -s "$HOME/.claude/.credentials.json" ] || [ -n "${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || exit 3
+      grep -q skipDangerousModePermissionPrompt "$HOME/.claude/settings.json" 2>/dev/null || exit 4
+    ' >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0) pass "logged in, and the permissions warning is accepted" ;;
+      3) warn "no Claude login found. Run: ./semperwake login $name" ;;
+      4) warn "permissions warning not accepted. Run: ./semperwake login $name" ;;
+      *) warn "could not check the login (exit $rc)" ;;
+    esac
+  fi
+
+  [ "$PROBLEMS" -eq 0 ] || { echo; echo "$PROBLEMS problem(s) to fix before $name can start."; return 1; }
+  echo; echo "$name is ready."
+}
+
+cmd_up() {
+  cmd_check "$1" || exit 1
+  compose "$1" up -d
+  echo
+  echo "$1 is starting. Watch it with: ./semperwake logs $1"
+}
+
+cmd_job() {
+  local name="$1" job="${2:-}" line
+  [[ "$job" =~ ^[A-Za-z0-9._-]+$ ]] || die "usage: ./semperwake job <agent> <job>"
+  line="{\"kind\":\"job\",\"job\":\"$job\",\"prompt_file\":\"/workspace/JOBS.md\",\"prompt_anchor\":\"$job\"}"
+  # Through the container, not the host path, so a cron job fails visibly when the
+  # agent is down rather than queueing work nobody is awake to read.
+  compose "$name" exec -T agent sh -c 'printf "%s\n" "$1" >> "$EVENT_JSONL"' sh "$line"
+  say "queued $job for $name"
+}
+
+cmd_list() {
+  local dir name state found=0
+  printf '%-20s %-10s %s\n' AGENT PROVIDER STATE
+  for dir in "$AGENTS"/*/; do
+    name="$(basename "$dir")"
+    [ "$name" != example ] || continue
+    found=1
+    state="$(docker ps --filter "label=com.docker.compose.project=semperwake-$name" \
+               --format '{{.Status}}' 2>/dev/null | head -n 1)"
+    local provider; provider="$(cfg "$name" CHAT_PROVIDER)"
+    printf '%-20s %-10s %s\n' "$name" "${provider:-none}" "${state:-stopped}"
+  done
+  [ "$found" -eq 1 ] || echo "(none yet: ./semperwake new <name>)"
+}
+
+command="${1:-help}"
+[ "$#" -eq 0 ] || shift
+case "$command" in
+  new)     cmd_new "$@" ;;
+  list)    cmd_list ;;
+  help|-h|--help) usage ;;
+  check|login|up|down|restart|status|attach|logs|job)
+    need_agent "${1:-}"
+    name="$1"; shift
+    case "$command" in
+      check)   cmd_check "$name" ;;
+      login)   compose "$name" run --rm agent claude --dangerously-skip-permissions ;;
+      up)      cmd_up "$name" ;;
+      down)    compose "$name" down ;;
+      # Recreated, not `compose restart`, which keeps the old .env and mounts.
+      restart) compose "$name" up -d --force-recreate ;;
+      status)  compose "$name" ps; compose "$name" exec -T agent "$name-attach" status ;;
+      attach)  compose "$name" exec agent "$name-attach" ;;
+      logs)    compose "$name" logs -f ;;
+      job)     cmd_job "$name" "$@" ;;
+    esac
+    ;;
+  *) usage >&2; exit 1 ;;
+esac

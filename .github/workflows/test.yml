@@ -14,7 +14,7 @@ jobs:
 
       - name: Syntax check every shell script
         run: |
-          for f in install.sh test/run-tests.sh; do
+          for f in install.sh semperwake docker/entrypoint.sh test/run-tests.sh; do
             echo "-- $f"
             bash -n "$f"
           done
@@ -23,3 +23,6 @@ jobs:
         # Hermetic: stubs tmux/systemctl/loginctl/claude/jq/curl and installs
         # into a throwaway HOME. Touches no systemd units and makes no network calls.
         run: ./test/run-tests.sh
+
+      - name: Build the Docker image
+        run: docker build -t semperwake .

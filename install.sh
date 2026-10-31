@@ -26,6 +26,9 @@
 #         itself with ScheduleWakeup. Start here.
 # Tier 2 (slack|discord): all five. Real-time wake on inbound messages.
 #
+# Docker: the image sets SUPERVISOR=container, which skips everything systemd-only
+# (linger, units) and leaves docker/entrypoint.sh to supervise the same scripts.
+#
 # Idempotent — safe to re-run. Run as the agent's OWN unix user, never root.
 set -euo pipefail
 
@@ -50,6 +53,7 @@ AGENT="${AGENT:-semp}"
 WORKSPACE="${WORKSPACE:-$HOME/$AGENT}"
 SESSION="${SESSION:-$AGENT}"
 STATE_DIR="${STATE_DIR:-/tmp/$AGENT-state}"
+SUPERVISOR="${SUPERVISOR:-systemd}"                       # systemd | container
 CHAT_PROVIDER="${CHAT_PROVIDER:-${EVENT_SOURCE:-none}}"   # none | slack | discord
 IDLE_STALL_SECS="${IDLE_STALL_SECS:-2400}"
 NUDGE_COOLDOWN_SECONDS="${NUDGE_COOLDOWN_SECONDS:-15}"
@@ -76,9 +80,15 @@ say() { echo "==> $*"; }
 [ "$(id -u)" -ne 0 ] || die "run as the agent's own user, not root"
 command -v tmux      >/dev/null || die "tmux not installed (apt install tmux)"
 command -v python3   >/dev/null || die "python3 required"
-command -v systemctl >/dev/null || die "systemd required"
-systemctl --user show-environment >/dev/null 2>&1 \
-  || die "no systemd --user bus. Log in properly (ssh/su -l), or: loginctl enable-linger $(whoami)"
+case "$SUPERVISOR" in
+  systemd)
+    command -v systemctl >/dev/null || die "systemd required (on macOS or without systemd, use Docker: see README)"
+    systemctl --user show-environment >/dev/null 2>&1 \
+      || die "no systemd --user bus. Log in properly (ssh/su -l), or: loginctl enable-linger $(whoami)"
+    ;;
+  container) ;;
+  *) die "SUPERVISOR must be one of: systemd container (got '$SUPERVISOR')" ;;
+esac
 
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 [ -x "$CLAUDE_BIN" ] || die "claude CLI not found. Install Claude Code: npm i -g @anthropic-ai/claude-code"
@@ -109,9 +119,11 @@ fi
 mkdir -p "$WORKSPACE"/{scripts,memory,config} "$UN" "$BIN" "$STATE_DIR"
 
 # ── 0. linger: user units must survive logout, or the agent dies when you ssh out
-say "enabling linger for $(whoami)"
-loginctl enable-linger "$(whoami)" 2>/dev/null \
-  || echo "    (could not self-enable; ask an admin for: loginctl enable-linger $(whoami))"
+if [ "$SUPERVISOR" = systemd ]; then
+  say "enabling linger for $(whoami)"
+  loginctl enable-linger "$(whoami)" 2>/dev/null \
+    || echo "    (could not self-enable; ask an admin for: loginctl enable-linger $(whoami))"
+fi
 
 # ── 1. the agent's env file — every script and unit sources this one file
 say "writing $WORKSPACE/agent.env"
@@ -120,6 +132,7 @@ AGENT=$AGENT
 SESSION=$SESSION
 WORKSPACE=$WORKSPACE
 STATE_DIR=$STATE_DIR
+SUPERVISOR=$SUPERVISOR
 CLAUDE_BIN=$CLAUDE_BIN
 CLAUDE_UNIT=$AGENT-claude.service
 EVENT_JSONL=$EVENT_JSONL
@@ -210,11 +223,17 @@ tmux new-session -d -s "$SESSION" -x 220 -y 60 \
 # Auto-load the prompt so a crash or reboot self-resumes the loop unattended.
 # 25s because claude renders a splash, checks for updates and loads project
 # context first; paste into that window and the prompt lands mangled.
-# Skipped if a human is attached, so we never clobber their typing.
+# Skipped if a human is attached, so we never clobber their typing, and if claude
+# is holding on a screen only a human can answer: the paste's Enter would take the
+# default, which on the bypass-permissions warning is "No, exit" — a restart loop
+# that never reaches the prompt. The watchdog alerts, then re-arms once it clears.
 (
-    sleep 25
+    sleep "${BOOTSTRAP_DELAY_SECS:-25}"
     if [ -n "$(tmux list-clients -t "$SESSION" 2>/dev/null)" ]; then
         log "human attached — skipping auto-bootstrap (run $AGENT-bootstrap by hand)"
+    elif tmux capture-pane -p -t "$SESSION" 2>/dev/null \
+            | grep -qiE 'select login method|paste code here|yes, i accept'; then
+        log "claude is waiting on a human — skipping auto-bootstrap"
     elif tmux has-session -t "$SESSION" 2>/dev/null && [ -f "$BOOTSTRAP_FILE" ]; then
         tmux load-buffer  -t "$SESSION" -b "$AGENT-boot" "$BOOTSTRAP_FILE"
         tmux paste-buffer -t "$SESSION" -b "$AGENT-boot"
@@ -350,7 +369,8 @@ cat > "$WORKSPACE/scripts/watchdog.sh" <<'SCRIPT'
 # Checks, in order of how silently each one kills the agent:
 #   1. unit not running             -> start it
 #   2. tmux session missing         -> restart the unit
-#   3. login/auth expired           -> ALERT (only a human can fix this)
+#   3. login/auth expired, or the
+#      bypass warning unanswered    -> ALERT (only a human can fix this)
 #   4. pane byte-identical too long -> loop frozen: re-bootstrap, else restart
 #   5. session alive, loop not armed-> re-bootstrap (a bare claude idles forever)
 #
@@ -373,6 +393,25 @@ alert() { # alert <key> <message> [dedupe-secs] — deduped so we never spam
     return 0
 }
 
+# The only place the watchdog touches its supervisor. In a container there are no
+# units: the entrypoint's restart loop owns run.sh, and run.sh exits once the tmux
+# session is gone, so killing the session IS the restart.
+unit_active() {
+    [ "$SUPERVISOR" = container ] && return 0
+    systemctl --user is-active --quiet "$CLAUDE_UNIT"
+}
+unit_start() {
+    [ "$SUPERVISOR" = container ] && return 0
+    systemctl --user start "$CLAUDE_UNIT"
+}
+unit_restart() {
+    if [ "$SUPERVISOR" = container ]; then
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+    else
+        systemctl --user restart "$CLAUDE_UNIT"
+    fi
+}
+
 restart_guarded() { # never restart-loop: at most once an hour
     local f="$STATE/last-restart" now; now="$(date +%s)"
     if [ -f "$f" ] && [ "$((now - $(cat "$f")))" -lt 3600 ]; then
@@ -380,13 +419,13 @@ restart_guarded() { # never restart-loop: at most once an hour
     fi
     echo "$now" > "$f"
     log "restarting $CLAUDE_UNIT"
-    systemctl --user restart "$CLAUDE_UNIT"
+    unit_restart
 }
 
 # 1. unit
-if ! systemctl --user is-active --quiet "$CLAUDE_UNIT"; then
+if ! unit_active; then
     log "$CLAUDE_UNIT inactive — starting"
-    systemctl --user start "$CLAUDE_UNIT" || alert unit-start-failed "$CLAUDE_UNIT will not start"
+    unit_start || alert unit-start-failed "$CLAUDE_UNIT will not start"
     exit 0
 fi
 
@@ -400,8 +439,12 @@ fi
 PANE="$(tmux capture-pane -p -t "$SESSION" 2>/dev/null || true)"
 
 # 3. login — a human-only fix, so alert rather than thrash the unit
-if printf '%s' "$PANE" | grep -qiE 'invalid api key|/login|please run .*login|authentication_error|credit balance'; then
+if printf '%s' "$PANE" | grep -qiE 'invalid api key|/login|please run .*login|authentication_error|credit balance|select login method|paste code here'; then
     alert login-expired "Claude login/credential problem — the agent cannot think until a human runs 'tmux attach -t $SESSION' and re-authenticates" 3600
+    exit 0
+fi
+if printf '%s' "$PANE" | grep -qi 'yes, i accept'; then
+    alert bypass-unaccepted "claude is holding on the bypass-permissions warning — a human must run 'tmux attach -t $SESSION' and accept it" 3600
     exit 0
 fi
 
@@ -426,7 +469,10 @@ fi
 
 # 5. armed? A restarted session with no prompt is a bare claude that idles
 # forever while every instrument reports it healthy.
-if ! printf '%s' "$PANE" | grep -qiE "$AGENT|loop|wake|queue|cursor"; then
+# A session younger than the runner's auto-paste delay is booting, not un-armed:
+# pasting now means the prompt lands in the splash and then arrives a second time.
+created="$(tmux display-message -p -t "$SESSION" '#{session_created}' 2>/dev/null || true)"
+if [ "$((now - ${created:-0}))" -ge 60 ] && ! printf '%s' "$PANE" | grep -qiE "$AGENT|loop|wake|queue|cursor"; then
     log "session appears un-armed (no loop prompt in pane)"
     [ -x "$BOOTSTRAP_CMD" ] && "$BOOTSTRAP_CMD" && log "bootstrap re-armed"
 fi
@@ -462,8 +508,11 @@ case "\${1:-attach}" in
              printf '  %-30s %s\n' "\$u" "\$(systemctl --user is-active "\$u" 2>/dev/null | head -1)"; done
            tmux has-session -t "\$SESSION" 2>/dev/null && echo "  tmux session: alive" || echo "  tmux session: MISSING"
            echo "  provider: \$CHAT_PROVIDER" ;;
-  restart) systemctl --user restart "\$AGENT-claude.service"; echo "restarted; prompt auto-loads in ~25s" ;;
-  logs)    exec journalctl --user -u "\$AGENT-claude.service" -u "\$AGENT-liveness.service" -n 100 -f ;;
+  restart) if [ "\$SUPERVISOR" = container ]; then tmux kill-session -t "\$SESSION"
+           else systemctl --user restart "\$AGENT-claude.service"; fi
+           echo "restarted; prompt auto-loads shortly after the session returns" ;;
+  logs)    [ "\$SUPERVISOR" = systemd ] || { echo "logs go to the container: run 'docker compose logs -f' on the host" >&2; exit 1; }
+           exec journalctl --user -u "\$AGENT-claude.service" -u "\$AGENT-liveness.service" -n 100 -f ;;
   *)       echo "usage: \$AGENT-attach {attach|status|restart|logs}" >&2; exit 1 ;;
 esac
 EOF
@@ -753,6 +802,13 @@ async function connect () {
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { clearInterval(hb); try { ws?.close() } catch {}; process.exit(0) })
 connect()
 SCRIPT
+fi
+
+# A container has no systemd to hand these to: docker/entrypoint.sh starts and
+# restarts the scripts generated above, and Docker restarts the container.
+if [ "$SUPERVISOR" = container ]; then
+  say "installed for container supervision (provider: $CHAT_PROVIDER)"
+  exit 0
 fi
 
 # ── 11. systemd units

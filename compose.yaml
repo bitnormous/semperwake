@@ -1,0 +1,37 @@
+# One project per agent, so each gets its own container, login and queue:
+#   AGENT=alpha docker compose up -d
+name: semperwake-${AGENT:-semp}
+
+services:
+  agent:
+    image: semperwake:local     # shared, so a second agent does not rebuild it
+    build:
+      context: .
+      args:
+        AGENT_UID: ${AGENT_UID:-1000}
+    init: true                  # reaps the processes tmux and claude leave behind
+    restart: unless-stopped
+    stop_grace_period: 20s
+    env_file:
+      - path: .env
+        required: false
+      - path: agents/${AGENT:-semp}/.env   # per-agent settings win over the shared file
+        required: false
+    # After env_file on purpose: these must match the mounts below, so nothing set
+    # in a .env can point the agent at a different directory from the one mounted.
+    environment:
+      AGENT: ${AGENT:-semp}
+      WORKSPACE: /workspace
+      STATE_DIR: /workspace/.run/state
+      EVENT_JSONL: /workspace/.run/events.jsonl
+      CURSOR_FILE: /workspace/.run/cursor.txt
+    volumes:
+      - home:/home/node         # claude login and settings
+      - ./agents/${AGENT:-semp}:/workspace  # prompt, memory, ledgers: edit these on the host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  home:

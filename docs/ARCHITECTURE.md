@@ -312,8 +312,12 @@ pricing that fit your Claude Code plan; this project makes no pricing guarantee.
 everything, and re-derives conclusions it reached an hour ago. The expensive part of an agent isn't
 the tokens, it's the context.
 
-**Why not Docker?** You can, and the tmux core is portable. But the agent's whole job is usually to
-operate the host — systemd, logs, deploys, databases. A container is a boundary in the wrong place.
+**Why not Docker?** It's supported, but it isn't the default. An agent whose job is to operate the
+host — systemd, logs, deploys, databases — is on the wrong side of a container boundary. Use Docker
+when that boundary is what you want, or when the host has no systemd. `docker/entrypoint.sh` runs the
+same generated scripts with a restart loop per process, not one shared exit, because restarting
+`claude` costs the agent its live context and a crashed nudger shouldn't. The watchdog has no units
+to manage there, so it restarts by killing the tmux session, which makes `run.sh` exit into its loop.
 
 **Why not a web dashboard instead of tmux?** `tmux attach` is already a perfect live view that
 needs no code, no port, and no auth layer of its own. `tmux capture-pane` is already an API.

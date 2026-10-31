@@ -117,6 +117,37 @@ c=$(some_query --json | jq 'length')
 [ -z "$c" ] && { echo "ERROR: auth/access — NOT zero"; exit 1; }
 ```
 
+### A first-run screen turns the auto-paste into a restart loop
+
+A fresh agent stopped at the bypass-permissions warning, whose default answer is `No, exit`. The
+paste's Enter chose it, `claude` exited, the unit restarted, and the same thing happened again. No
+turn ever ran.
+
+Logged out was quieter still. There's no error text, only a login picker, so the watchdog matched
+nothing, called the session un-armed, pasted the prompt into the login flow and logged `ok` on every
+pass.
+
+Neither appears in a stubbed test. Both were found by running the real `claude` in a clean container.
+
+**The check:** read the pane before typing into it, and alert on anything only a human can answer.
+
+```bash
+tmux capture-pane -p -t "$SESSION" \
+  | grep -qiE 'select login method|paste code here|yes, i accept' && alert_a_human
+```
+
+### The watchdog and the auto-paste can both arm the same session
+
+A session in its first 25 seconds shows a splash with no loop markers, which is exactly what
+"un-armed" looks like. If the watchdog fires in that window, it pastes, and then the runner pastes
+again.
+
+**The check:** don't judge a session younger than the auto-paste delay.
+
+```bash
+tmux display-message -p -t "$SESSION" '#{session_created}'
+```
+
 ---
 
 ## Family 2 — the agent is confidently wrong about its own numbers

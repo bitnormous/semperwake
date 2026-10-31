@@ -21,14 +21,22 @@ check, a guard in the installer, a line in the prompt template.
 ## Running the tests
 
 ```bash
-./test/run-tests.sh          # ~10 seconds
+./test/run-tests.sh          # ~15 seconds, Linux only (needs GNU sed and stat)
 KEEP=1 ./test/run-tests.sh   # keep the sandbox to poke at
 ```
 
-The suite is hermetic: it stubs `tmux`, `systemctl`, `loginctl`, `claude` and `curl`, installs
+On macOS, run it inside the image:
+
+```bash
+docker build -t semperwake:local .
+docker run --rm -v "$PWD":/src:ro --entrypoint bash semperwake:local \
+  -c 'cp -r /src /tmp/repo && cd /tmp/repo && ./test/run-tests.sh'
+```
+
+The suite is hermetic: it stubs `tmux`, `systemctl`, `loginctl`, `claude`, `curl` and `docker`, installs
 into a throwaway `HOME`, and asserts behaviour rather than output formatting. It will not touch your
 systemd units, your tmux sessions, your network, or your real agent. The hermeticity checks are in
-section 10.
+section 12.
 
 **Any behavioural change needs a test.** The whole premise of this repo is that silent failure is
 the enemy, so a change you cannot demonstrate is a change that might be doing nothing.

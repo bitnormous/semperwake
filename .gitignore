@@ -19,3 +19,14 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# one working directory per agent. These hold private notes and tokens, so only
+# the docs and the example profile are public.
+/agents/*
+!/agents/README.md
+!/agents/example/
+/agents/example/.run/
+/agents/example/config/
+/agents/example/memory/
+/agents/example/scripts/
+/agents/example/BOOTSTRAP-PROMPT.txt

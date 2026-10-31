@@ -1,0 +1,5 @@
+# Allowlist, so .env and a filled-in workspace can never end up in an image layer.
+*
+!install.sh
+!prompts/
+!docker/
