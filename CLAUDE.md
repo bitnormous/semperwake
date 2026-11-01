@@ -50,7 +50,7 @@ The first image build takes several minutes. `docker build` needs no buildx.
 
 ### Generated files: edit the source
 
-`run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `signal-filter.py`, the listeners and the
+`run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `typing.sh`, `signal-filter.py`, the listeners and the
 `<agent>-attach` and `<agent>-bootstrap` helpers **do not exist in this repo as files**. They are
 heredocs in `install.sh`, written to `<workspace>/scripts/` and `~/.local/bin/` at install time.
 
@@ -88,6 +88,7 @@ Nothing enforces these except tests and care, so change every location together:
 | Template substitutions | `install.sh` step 2 and `cmd_new` in `semperwake` |
 | Docker queue and state paths | `compose.yaml` and `cmd_new` in `semperwake` |
 | Watchdog cadence (90s, 120s) | `entrypoint.sh` defaults and the systemd timer in `install.sh` |
+| Which messages expect a reply (`[OWNER-DM]`, `[OWNER-CHAN]`, `[MENTION]`) | `signal-filter.py` and `reply_channel` in `nudger.sh`, both in `install.sh` |
 
 ## Code style
 

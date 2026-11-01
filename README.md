@@ -539,6 +539,7 @@ scripts/run.sh                tmux + claude + auto-bootstrap
 scripts/nudger.sh             debounced wake on actionable events
 scripts/watchdog.sh           liveness checks
 scripts/notify.sh             provider-agnostic "send a message"
+scripts/typing.sh             Discord "typing…" until the agent replies
 scripts/signal-filter.py      firehose → tagged signal
 scripts/<provider>-listener.mjs   installed only for Slack or Discord
 ```
@@ -556,7 +557,7 @@ everything in a throwaway `HOME`, and asserts real behaviour:
 
 - the no-chat, Slack and Discord tiers, and `.env` loading and precedence
 - signal-filter tagging across mixed providers, and cursor semantics under rotation
-- nudge debounce under burst, and notify routing per provider
+- nudge debounce under burst, notify routing per provider, and the Discord typing indicator
 - every watchdog path, including alert dedupe
 - container supervision and the `semperwake` command
 

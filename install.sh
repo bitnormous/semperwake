@@ -57,6 +57,7 @@ SUPERVISOR="${SUPERVISOR:-systemd}"                       # systemd | container
 CHAT_PROVIDER="${CHAT_PROVIDER:-${EVENT_SOURCE:-none}}"   # none | slack | discord
 IDLE_STALL_SECS="${IDLE_STALL_SECS:-2400}"
 NUDGE_COOLDOWN_SECONDS="${NUDGE_COOLDOWN_SECONDS:-15}"
+TYPING_MAX_SECS="${TYPING_MAX_SECS:-120}"
 OWNER_ID="${OWNER_ID:-${OWNER_SLACK_USER:-}}"
 SELF_BOT_ID="${SELF_BOT_ID:-}"
 OWNER_DM_CHANNEL="${OWNER_DM_CHANNEL:-}"
@@ -142,6 +143,7 @@ BOOTSTRAP_CMD=$BIN/$AGENT-bootstrap
 IDLE_STALL_SECS=$IDLE_STALL_SECS
 NUDGE_COOLDOWN_SECONDS=$NUDGE_COOLDOWN_SECONDS
 NUDGE_PATTERN=$NUDGE_PATTERN
+TYPING_MAX_SECS=$TYPING_MAX_SECS
 CHAT_PROVIDER=$CHAT_PROVIDER
 OWNER_ID=$OWNER_ID
 SELF_BOT_ID=$SELF_BOT_ID
@@ -313,12 +315,46 @@ case "${CHAT_PROVIDER:-none}" in
          -d "{\"content\":$(json_str "$TEXT")}" \
          "https://discord.com/api/v10/channels/$CHAN/messages")"
     confirmed "$RESP" id || undelivered "$RESP"
+    # A delivered reply ends the wait, or typing.sh would show "typing…" again.
+    rm -f "$STATE"/typing/*
     ;;
   *)
     # Tier 1: no chat provider. Log it so the alert is at least recoverable.
     echo "$(date -u +%FT%TZ) [notify:$AGENT] $TEXT" >> "$STATE/notify.log"
     ;;
 esac
+SCRIPT
+
+say "writing scripts/typing.sh"
+cat > "$WORKSPACE/scripts/typing.sh" <<'SCRIPT'
+#!/bin/bash
+# typing.sh <channel> — show "typing…" in a Discord channel while the agent works.
+# The nudger starts this, and a delivered notify.sh message ends it by removing the
+# marker. TYPING_MAX_SECS bounds it, because the agent may decide not to answer.
+#
+# Purely cosmetic, so nothing waits for it and its curl result is ignored: a failure
+# here must never get in the way of the real reply.
+set -uo pipefail
+source "${AGENT_ENV:?AGENT_ENV not set}"
+CHAN="${1:?usage: typing.sh <channel>}"
+[ "${CHAT_PROVIDER:-none}" = discord ] || exit 0
+[ "${TYPING_MAX_SECS:-120}" -gt 0 ] || exit 0
+DIR="${STATE_DIR:-/tmp/$AGENT-state}/typing"; mkdir -p "$DIR"
+MARK="$DIR/$CHAN"
+# Written before taking the lock, so a follow-up message extends a running loop.
+echo "$(($(date +%s) + TYPING_MAX_SECS))" > "$MARK"
+# Hidden, so that notify.sh's glob removes the marker and leaves this alone.
+LOCK="$DIR/.$CHAN.lock"
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rm -rf "$LOCK"' EXIT
+while [ "$(date +%s)" -lt "$(cat "$MARK" 2>/dev/null || echo 0)" ]; do
+    curl -s -o /dev/null --max-time 5 -X POST -d '' \
+         -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+         "https://discord.com/api/v10/channels/$CHAN/typing"
+    # Discord documents the indicator as lasting about 10s, so renew it inside that.
+    sleep "${TYPING_EVERY_SECS:-8}"
+done
+rm -f "$MARK"
 SCRIPT
 
 # ── 6. nudger: this is what makes the agent real-time rather than a poller
@@ -340,6 +376,9 @@ source "${AGENT_ENV:?AGENT_ENV not set}"
 STATE="${STATE_DIR:-/tmp/$AGENT-state}/nudger"; mkdir -p "$STATE"
 LAST="$STATE/last-nudge"
 log() { echo "$(date -u +%FT%TZ) [$AGENT-nudger] $*"; }
+# State survives a restart. A lock left by a killed typing.sh would otherwise block
+# that channel for good, and clearing the markers stops any loop still running.
+rm -rf "${STATE_DIR:-/tmp/$AGENT-state}/typing"
 
 # Build the actionable pattern from the normalized envelope.
 PAT='"mentions_self":true'
@@ -366,6 +405,32 @@ nudge() { # nudge <why>
     log "nudged: $1"
 }
 
+# The Discord channel to show "typing…" in, or nothing. Only for what signal-filter.py
+# tags [OWNER-DM], [OWNER-CHAN] or [MENTION], which the agent is expected to answer: an
+# [INCIDENT] or [JOB] often ends in silence, and "typing…" would promise a reply. The
+# id becomes a file name and part of a URL, so anything but digits is refused.
+reply_channel() { # reply_channel <event line>
+    printf '%s' "$1" | python3 -c '
+import json,sys
+owner,me,chans=sys.argv[1:]
+e=json.load(sys.stdin)
+ch=str(e.get("channel") or "")
+if e.get("provider")!="discord" or e.get("kind")!="message" or not ch.isdigit(): sys.exit()
+if e.get("is_bot") or (me and e.get("user")==me): sys.exit()
+mine=owner and e.get("user")==owner
+if (mine and (e.get("channel_type")=="dm" or ch in chans.split(","))) or e.get("mentions_self"):
+    print(ch)' "${OWNER_ID:-}" "${SELF_BOT_ID:-}" "${OWNER_CHANNELS:-}" 2>/dev/null
+}
+
+show_typing() { # show_typing <event line>
+    local chan
+    chan="$(reply_channel "$1")"
+    [ -n "$chan" ] || return 0
+    # With no session, nothing is working on this message, so don't imply otherwise.
+    tmux has-session -t "$SESSION" 2>/dev/null || return 0
+    AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/typing.sh" "$chan" >/dev/null 2>&1 &
+}
+
 while [ ! -f "$EVENT_JSONL" ]; do
     log "waiting for $EVENT_JSONL to appear"   # log BEFORE blocking: a process
     sleep 5                                    # waiting on a file that never
@@ -373,7 +438,9 @@ done                                           # appears must not look healthy
 log "watching $EVENT_JSONL"
 log "actionable pattern: $PAT"
 tail -n0 -F "$EVENT_JSONL" 2>/dev/null | while IFS= read -r line; do
-    printf '%s' "$line" | grep -qE "$PAT" && nudge "$(printf '%s' "$line" | cut -c1-140)"
+    printf '%s' "$line" | grep -qE "$PAT" || continue
+    show_typing "$line"   # before nudge, so a debounced message still shows it
+    nudge "$(printf '%s' "$line" | cut -c1-140)"
 done
 SCRIPT
 
@@ -533,7 +600,7 @@ case "\${1:-attach}" in
 esac
 EOF
 chmod 0755 "$BIN/$AGENT-bootstrap" "$BIN/$AGENT-attach"
-chmod 0755 "$WORKSPACE/scripts"/{run.sh,nudger.sh,watchdog.sh,notify.sh}
+chmod 0755 "$WORKSPACE/scripts"/{run.sh,nudger.sh,watchdog.sh,notify.sh,typing.sh}
 
 # ── 9. the signal filter (provider-agnostic; works on the normalized envelope)
 say "writing scripts/signal-filter.py"

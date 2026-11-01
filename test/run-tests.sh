@@ -93,7 +93,8 @@ grep -qE '^(SLACK_BOT_TOKEN|SLACK_APP_TOKEN|DISCORD_BOT_TOKEN)=.+' "$REPO/.env.e
   && bad ".env.example carries no real tokens" || ok ".env.example carries no real tokens"
 # every var the installer reads should be documented in .env.example
 for v in AGENT CHAT_PROVIDER OWNER_ID SELF_BOT_ID OWNER_CHANNELS INCIDENT_CHANNELS \
-         IDLE_STALL_SECS NUDGE_COOLDOWN_SECONDS SLACK_APP_TOKEN SLACK_BOT_TOKEN DISCORD_BOT_TOKEN; do
+         IDLE_STALL_SECS NUDGE_COOLDOWN_SECONDS TYPING_MAX_SECS \
+         SLACK_APP_TOKEN SLACK_BOT_TOKEN DISCORD_BOT_TOKEN; do
   grep -qE "^#?$v=" "$REPO/.env.example" || bad "$v documented in .env.example"
 done
 ok "all config vars documented in .env.example"
@@ -126,7 +127,7 @@ assert_nofile "NO listener unit"       "$H1/.config/systemd/user/solo-listener.s
 assert_nofile "NO nudger unit"         "$H1/.config/systemd/user/solo-nudger.service"
 assert_nofile "NO listener script"     "$H1/solo/scripts/slack-listener.mjs"
 
-for f in run.sh nudger.sh watchdog.sh notify.sh; do
+for f in run.sh nudger.sh watchdog.sh notify.sh typing.sh; do
   bash -n "$H1/solo/scripts/$f" && ok "generated $f parses" || bad "generated $f parses"
 done
 bash -n "$H1/.local/bin/solo-bootstrap" && ok "solo-bootstrap parses" || bad "solo-bootstrap parses"
@@ -153,6 +154,7 @@ AGENT=envagent
 CHAT_PROVIDER=none
 IDLE_STALL_SECS=1234
 NUDGE_COOLDOWN_SECONDS=7
+TYPING_MAX_SECS=45
 OWNER_ID=UFROMENV
 OWNER_CHANNELS=CONE,CTWO
 QUOTED_VALUE="with quotes"
@@ -165,6 +167,7 @@ assert_file "agent named from .env" "$H3/envagent/agent.env"
 AE="$(cat "$H3/envagent/agent.env" 2>/dev/null)"
 assert_contains ".env IDLE_STALL_SECS applied"  "$AE" "IDLE_STALL_SECS=1234"
 assert_contains ".env NUDGE_COOLDOWN applied"   "$AE" "NUDGE_COOLDOWN_SECONDS=7"
+assert_contains ".env TYPING_MAX_SECS applied"  "$AE" "TYPING_MAX_SECS=45"
 assert_contains ".env OWNER_ID applied"         "$AE" "OWNER_ID=UFROMENV"
 assert_contains ".env OWNER_CHANNELS applied"   "$AE" "OWNER_CHANNELS=CONE,CTWO"
 assert_lacks    "comments not parsed as vars"   "$AE" "a comment"
@@ -311,6 +314,77 @@ assert_contains "refused discord message is kept in notify.log" \
   "$(cat "$SANDBOX/state-disc/notify.log" 2>/dev/null)" "UNDELIVERED: refused by discord"
 assert_contains "refused slack message is kept in notify.log" \
   "$(cat "$SANDBOX/state-nova/notify.log" 2>/dev/null)" "UNDELIVERED: refused by slack"
+
+# "typing…" must show only where a reply is expected, and end with the reply
+TJ="$SANDBOX/typing-events.jsonl"; TL="$SANDBOX/typing-curl.log"; TS="$SANDBOX/state-disc/typing"
+TENV="$SANDBOX/typing.env"; : > "$TJ"; : > "$TL"
+sed -e "s|^EVENT_JSONL=.*|EVENT_JSONL=$TJ|" -e 's/^OWNER_CHANNELS=.*/OWNER_CHANNELS=222/' \
+    -e 's/^INCIDENT_CHANNELS=.*/INCIDENT_CHANNELS=333/' -e 's/^TYPING_MAX_SECS=.*/TYPING_MAX_SECS=30/' \
+    "$DW/agent.env" > "$TENV"
+typing_posts() { grep -c "channels/$1/typing" "$TL"; }
+# A lock left by a killed loop must not block its channel after a restart
+mkdir -p "$TS/.111.lock"
+( export AGENT_ENV="$TENV" SENDKEYS_LOG="$SK" PATH="$STUB:$PATH" CURL_LOG="$TL" TYPING_EVERY_SECS=1
+  bash "$DW/scripts/nudger.sh" > "$SANDBOX/typing-nudger.out" 2>&1 ) &
+NP=$!
+sleep 1
+OWNER=123456789012345678
+cat >> "$TJ" <<EOF
+{"provider":"discord","kind":"message","channel":"111","channel_type":"dm","user":"$OWNER","text":"owner dm"}
+{"provider":"discord","kind":"message","channel":"222","channel_type":"channel","user":"$OWNER","text":"owner channel"}
+{"provider":"discord","kind":"message","channel":"444","channel_type":"channel","user":"UX","text":"hi","mentions_self":true}
+{"provider":"discord","kind":"message","channel":"333","channel_type":"channel","user":"BOT","text":"deploy ok","is_bot":true}
+{"provider":"discord","kind":"message","channel":"555","channel_type":"channel","user":"$OWNER","text":"unwatched"}
+{"provider":"discord","kind":"message","channel":"../666","channel_type":"dm","user":"$OWNER","text":"bad id"}
+{"provider":"slack","kind":"message","channel":"777","channel_type":"dm","user":"$OWNER","text":"other provider"}
+{"kind":"job","job":"daily"}
+EOF
+sleep 3
+TALL="$(cat "$TL")"
+assert_contains "typing shows for an owner DM"           "$TALL" "channels/111/typing"
+assert_contains "typing shows in an owner channel"       "$TALL" "channels/222/typing"
+assert_contains "typing shows for a mention"             "$TALL" "channels/444/typing"
+assert_lacks "no typing for a bot alert"                 "$TALL" "channels/333/typing"
+assert_lacks "no typing in an unwatched channel"         "$TALL" "channels/555/typing"
+assert_lacks "no typing for a malformed channel id"      "$TALL" "666"
+assert_lacks "no typing for another provider"            "$TALL" "channels/777/typing"
+[ "$(typing_posts 111)" -ge 2 ] && ok "typing is renewed while the agent works" \
+  || bad "typing is renewed while the agent works" "posts: $(typing_posts 111)"
+env AGENT_ENV="$TENV" PATH="$STUB:$PATH" bash "$DW/scripts/notify.sh" "the reply" 111 >/dev/null 2>&1
+sleep 2
+N="$(typing_posts 111)"; sleep 2
+assert_eq "a delivered reply stops typing" "$(typing_posts 111)" "$N"
+[ ! -e "$TS/.111.lock" ] && ok "a finished loop frees its channel" || bad "a finished loop frees its channel"
+kill $NP 2>/dev/null; wait $NP 2>/dev/null
+rm -rf "$TS"; : > "$TL"
+
+typing_env() { sed "s/^TYPING_MAX_SECS=.*/TYPING_MAX_SECS=$1/" "$DW/agent.env" > "$TENV"; }
+run_typing() { # run_typing <channel> [env file]
+  env AGENT_ENV="${2:-$TENV}" PATH="$STUB:$PATH" CURL_LOG="$TL" TYPING_EVERY_SECS="${TYPING_EVERY_SECS:-1}" \
+    bash "$DW/scripts/typing.sh" "$1" >/dev/null 2>&1
+}
+typing_env 1; run_typing 801
+assert_contains "typing posts to the discord api" "$(cat "$TL")" "discord.com/api/v10/channels/801/typing"
+[ ! -e "$TS/801" ] && ok "unanswered typing stops at TYPING_MAX_SECS" \
+  || bad "unanswered typing stops at TYPING_MAX_SECS"
+typing_env 0; run_typing 802
+assert_eq "TYPING_MAX_SECS=0 turns typing off" "$(typing_posts 802)" "0"
+run_typing 803 "$W/agent.env"
+assert_eq "typing is discord only" "$(typing_posts 803)" "0"
+# A follow-up message extends the running loop, and must not start a second one
+typing_env 30
+TYPING_EVERY_SECS=30 run_typing 804 &
+TP=$!
+sleep 1
+FIRST="$(cat "$TS/804")"
+sleep 1
+TYPING_EVERY_SECS=30 run_typing 804
+assert_eq "a follow-up doesn't start a second loop" "$(typing_posts 804)" "1"
+[ "$(cat "$TS/804")" -gt "$FIRST" ] && ok "a follow-up extends the deadline" \
+  || bad "a follow-up extends the deadline"
+kill $TP 2>/dev/null; wait $TP 2>/dev/null
+pkill -f "scripts/typing.sh 804" 2>/dev/null
+rm -rf "$TS"
 # Tier 1 has no provider: the alert must still be recoverable from disk
 env AGENT_ENV="$H1/solo/agent.env" PATH="$STUB:$PATH" \
   bash "$H1/solo/scripts/notify.sh" "tier1 alert" >/dev/null 2>&1
