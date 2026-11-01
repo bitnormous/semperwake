@@ -262,6 +262,20 @@ TEXT="${1:?usage: notify.sh <text> [channel]}"
 CHAN="${2:-${ALERT_CHANNEL:-$OWNER_DM_CHANNEL}}"
 STATE="${STATE_DIR:-/tmp/$AGENT-state}"; mkdir -p "$STATE"
 json_str() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+# A silent failure here reads as "the owner was told", so a post only counts when
+# the API's reply says so. curl's exit status can't show that: Discord refuses
+# with a 4xx body, and Slack refuses with HTTP 200 and "ok":false.
+confirmed() { # confirmed <response> <key that must be truthy>
+  printf '%s' "$1" | python3 -c '
+import json,sys
+sys.exit(0 if json.load(sys.stdin).get(sys.argv[1]) else 1)' "$2" 2>/dev/null
+}
+# The message may be an alert the owner still needs, so keep it on disk.
+undelivered() { # undelivered <response>
+  echo "$(date -u +%FT%TZ) [notify:$AGENT] UNDELIVERED: $TEXT | response: ${1:-none}" >> "$STATE/notify.log"
+  echo "notify: delivery failed: ${1:-no response}" >&2
+  exit 1
+}
 
 case "${CHAT_PROVIDER:-none}" in
   slack)
@@ -276,10 +290,11 @@ case "${CHAT_PROVIDER:-none}" in
       fi
     fi
     [ -n "$CHAN" ] || { echo "notify: no slack channel resolved" >&2; exit 1; }
-    curl -s --max-time 12 -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    RESP="$(curl -s --max-time 12 -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
          -H 'Content-type: application/json; charset=utf-8' \
          -d "{\"channel\":\"$CHAN\",\"text\":$(json_str "$TEXT")}" \
-         https://slack.com/api/chat.postMessage >/dev/null
+         https://slack.com/api/chat.postMessage)"
+    confirmed "$RESP" ok || undelivered "$RESP"
     ;;
   discord)
     if [ -z "$CHAN" ]; then
@@ -293,10 +308,11 @@ case "${CHAT_PROVIDER:-none}" in
       fi
     fi
     [ -n "$CHAN" ] || { echo "notify: no discord channel resolved" >&2; exit 1; }
-    curl -s --max-time 12 -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+    RESP="$(curl -s --max-time 12 -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
          -H 'Content-Type: application/json' \
          -d "{\"content\":$(json_str "$TEXT")}" \
-         "https://discord.com/api/v10/channels/$CHAN/messages" >/dev/null
+         "https://discord.com/api/v10/channels/$CHAN/messages")"
+    confirmed "$RESP" id || undelivered "$RESP"
     ;;
   *)
     # Tier 1: no chat provider. Log it so the alert is at least recoverable.

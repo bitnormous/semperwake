@@ -55,14 +55,20 @@ printf '#!/bin/bash\nexit 0\n' > "$STUB/loginctl"
 printf '#!/bin/bash\necho "AGENT=${AGENT:-} $*" >> "${DOCKER_LOG:-/dev/null}"\n' > "$STUB/docker"
 printf '#!/bin/bash\nexit 0\n' > "$STUB/claude"
 # curl must never reach the network. Record the call, return a plausible body
-# for both providers' DM-resolution endpoints.
+# for both providers' DM-resolution endpoints and for a post. CURL_POST_BODY
+# overrides the reply to a post, so tests can stage a refusal.
 cat > "$STUB/curl" <<'EOF'
 #!/bin/bash
 echo "$*" >> "${CURL_LOG:-/dev/null}"
 case "$*" in
-  *users/@me/channels*) echo '{"id":"DISCORDDM"}' ;;
-  *conversations.open*) echo '{"ok":true,"channel":{"id":"SLACKDM"}}' ;;
-  *)                    echo '{"ok":true}' ;;
+  *users/@me/channels*)  echo '{"id":"DISCORDDM"}' ;;
+  *conversations.open*)  echo '{"ok":true,"channel":{"id":"SLACKDM"}}' ;;
+  *)
+    if [ -n "${CURL_POST_BODY:-}" ]; then printf '%s\n' "$CURL_POST_BODY"; exit 0; fi
+    case "$*" in
+      *channels/*/messages*) echo '{"id":"MSG1"}' ;;
+      *)                     echo '{"ok":true}' ;;
+    esac ;;
 esac
 EOF
 chmod +x "$STUB"/*
@@ -287,6 +293,24 @@ DW="$H5/disc"; CL2="$SANDBOX/curl2.log"; : > "$CL2"
 env AGENT_ENV="$DW/agent.env" PATH="$STUB:$PATH" CURL_LOG="$CL2" \
   bash "$DW/scripts/notify.sh" "test alert" >/dev/null 2>&1
 assert_contains "notify posts via discord api" "$(cat "$CL2")" "discord.com/api"
+# A post only counts when the API's reply confirms it, whatever curl's exit status
+notify_exit() { # notify_exit <workspace> <text> [reply to the post]
+  env AGENT_ENV="$1/agent.env" PATH="$STUB:$PATH" CURL_POST_BODY="${3:-}" \
+    bash "$1/scripts/notify.sh" "$2" >/dev/null 2>&1
+  echo $?
+}
+assert_eq "discord delivery exits 0" "$(notify_exit "$DW" "sent")" "0"
+assert_eq "slack delivery exits 0"   "$(notify_exit "$W" "sent")" "0"
+assert_eq "discord refusal exits 1" \
+  "$(notify_exit "$DW" "refused by discord" '{"code":50001,"message":"Missing Access"}')" "1"
+assert_eq "slack refusal exits 1" \
+  "$(notify_exit "$W" "refused by slack" '{"ok":false,"error":"channel_not_found"}')" "1"
+assert_eq "discord non-JSON reply exits 1" "$(notify_exit "$DW" "bad gateway" '<html>502</html>')" "1"
+assert_eq "slack non-JSON reply exits 1"   "$(notify_exit "$W" "bad gateway" '<html>502</html>')" "1"
+assert_contains "refused discord message is kept in notify.log" \
+  "$(cat "$SANDBOX/state-disc/notify.log" 2>/dev/null)" "UNDELIVERED: refused by discord"
+assert_contains "refused slack message is kept in notify.log" \
+  "$(cat "$SANDBOX/state-nova/notify.log" 2>/dev/null)" "UNDELIVERED: refused by slack"
 # Tier 1 has no provider: the alert must still be recoverable from disk
 env AGENT_ENV="$H1/solo/agent.env" PATH="$STUB:$PATH" \
   bash "$H1/solo/scripts/notify.sh" "tier1 alert" >/dev/null 2>&1

@@ -220,6 +220,18 @@ for u in $(systemctl --user list-timers --all --no-legend | awk '{print $NF}'); 
   printf '%-46s %s\n' "$u" "$(systemctl --user show "$u" -p Result --value)"; done | grep -v success
 ```
 
+### A sent message is not a delivered message
+
+`notify.sh` used to discard the API's reply, so a refused message looked like a success and the agent
+reported the owner as told. curl's exit status can't show this: Discord refuses with a 4xx body, and
+Slack refuses with HTTP 200 and `"ok":false`.
+
+`notify.sh` now exits 1 unless the reply confirms the post, and keeps the refused message on disk:
+
+```bash
+grep UNDELIVERED agents/<name>/.run/state/notify.log   # in Docker. Natively, look in $STATE_DIR
+```
+
 ### Filter process counts on the executable, never the command line
 
 `pgrep -f X` matches the whole command line — including wrapper processes (`/bin/sh -c …`,
