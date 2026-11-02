@@ -789,6 +789,8 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15)
 if (!TOKEN) { console.error(`${TAG} FATAL: DISCORD_BOT_TOKEN missing`); process.exit(1) }
 
 let ws = null, seq = null, hb = null, sessionId = null, resumeUrl = null, delay = 1000
+const selfRoles = new Set()
+const noteRole = (r) => { if (SELF && r?.tags?.bot_id === SELF) selfRoles.add(r.id) }
 const log = (lvl, m, x) => (lvl === 'error' || lvl === 'warn' ? console.error : console.log)(
   `${new Date().toISOString()} ${TAG} [${lvl}] ${m}${x ? ' ' + JSON.stringify(x) : ''}`)
 const write = (r) => { try { fs.appendFileSync(OUT, JSON.stringify(r) + '\n') } catch (e) { log('error', 'append failed', { e: e.message }) } }
@@ -797,6 +799,7 @@ function normalize (msg) {
   const text = msg.content || ''
   const mentioned = SELF
     ? (msg.mentions || []).some((u) => u.id === SELF) || text.includes(`<@${SELF}>`)
+      || (msg.mention_roles || []).some((id) => selfRoles.has(id))
     : false
   return {
     ts: new Date().toISOString(),
@@ -876,6 +879,8 @@ async function connect () {
           return
         }
         if (m.t === 'MESSAGE_CREATE') return write(normalize(m.d))
+        if (m.t === 'GUILD_CREATE') return (m.d.roles || []).forEach(noteRole)
+        if (m.t === 'GUILD_ROLE_CREATE' || m.t === 'GUILD_ROLE_UPDATE') return noteRole(m.d.role)
         return
     }
   })
