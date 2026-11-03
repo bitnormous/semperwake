@@ -211,6 +211,45 @@ if command -v node >/dev/null; then
   # MESSAGE_CONTENT (1<<15) must be in the intents or every message is empty
   node -e 'const i=1|(1<<9)|(1<<12)|(1<<15); if(!(i & (1<<15))) process.exit(1)' \
     && ok "intents include MESSAGE_CONTENT" || bad "intents include MESSAGE_CONTENT"
+
+  # A managed-role mention arrives in mention_roles, not mentions. Replay Gateway
+  # frames through the real generated listener, with the socket stubbed out.
+  cat > "$SANDBOX/gateway-stub.mjs" <<'STUB'
+const self = '987654321098765432'
+const dispatch = (t, d) => ({ op: 0, s: 1, t, d })
+const msg = (mention_roles) => dispatch('MESSAGE_CREATE', {
+  guild_id: 'G1', channel_id: 'C1', author: { id: 'U1' }, content: 'hi', mentions: [], mention_roles })
+const frames = [
+  msg(['R1']),                       // before GUILD_CREATE: role not known yet
+  dispatch('GUILD_CREATE', { roles: [{ id: 'R1', tags: { bot_id: self } },
+                                     { id: 'R2', tags: { bot_id: 'someone-else' } },
+                                     { id: 'R3' }] }),
+  msg(['R1']), msg(['R2']), msg(['R3']), msg([]),
+  dispatch('GUILD_ROLE_CREATE', { guild_id: 'G2', role: { id: 'R4', tags: { bot_id: self } } }),
+  msg(['R4']),
+  dispatch('GUILD_ROLE_UPDATE', { guild_id: 'G3', role: { id: 'R5', tags: { bot_id: self } } }),
+  msg(['R5']),
+]
+globalThis.fetch = async () => ({ json: async () => ({ url: 'wss://stub.invalid' }) })
+globalThis.WebSocket = class {
+  addEventListener (type, fn) {
+    if (type !== 'message') return
+    setImmediate(() => {
+      for (const f of frames) fn({ data: JSON.stringify(f) })
+      process.exit(0)
+    })
+  }
+  send () {}
+  close () {}
+}
+STUB
+  RJ="$SANDBOX/role-events.jsonl"
+  DISCORD_BOT_TOKEN=dtok SELF_BOT_ID=987654321098765432 EVENT_JSONL="$RJ" \
+    node --import "$SANDBOX/gateway-stub.mjs" "$H5/disc/scripts/discord-listener.mjs" >/dev/null 2>&1
+  assert_eq "only the bot's own managed role counts as a mention" \
+    "$(python3 -c 'import json,sys
+print(" ".join(str(json.loads(l)["mentions_self"]).lower() for l in open(sys.argv[1])))' "$RJ")" \
+    "false true false false false true true"
 else printf '  - skipped (no node): discord listener syntax\n'; fi
 # an unknown provider must be rejected, not silently accepted
 OUT="$(run_install "$SANDBOX/h5b" bad CHAT_PROVIDER=telegram 2>&1 || true)"
