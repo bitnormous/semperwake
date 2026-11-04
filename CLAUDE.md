@@ -50,7 +50,7 @@ The first image build takes several minutes. `docker build` needs no buildx.
 
 ### Generated files: edit the source
 
-`run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `typing.sh`, `signal-filter.py`, the listeners and the
+`claude.sh`, `run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `typing.sh`, `signal-filter.py`, the listeners and the
 `<agent>-attach` and `<agent>-bootstrap` helpers **do not exist in this repo as files**. They are
 heredocs in `install.sh`, written to `<workspace>/scripts/` and `~/.local/bin/` at install time.
 
@@ -82,12 +82,13 @@ Nothing enforces these except tests and care, so change every location together:
 | Value | Locations |
 |---|---|
 | Prompt placeholders `<OWNER_NAME\|FILL IN\|ONE PARAGRAPH>` | `PLACEHOLDERS` in `semperwake`, `placeholders` in `docker/entrypoint.sh`, the template, and the `fill` helper and `sed` in tests |
-| Human-only screens: `select login method`, `paste code here`, `yes, i accept` | `run.sh` and `watchdog.sh`, both in `install.sh` |
+| Human-only screens: `select login method`, `paste code here`, `yes, i accept`, `custom api key` | `run.sh` and `watchdog.sh`, both in `install.sh` |
 | Paste delay (25s) must stay below the watchdog's boot grace (60s) | `run.sh` and check 5 in `watchdog.sh` |
 | `IDLE_STALL_SECS` (2400) must exceed the longest idle wake (600s) | `.env.example`, `install.sh`, the prompt |
 | Template substitutions | `install.sh` step 2 and `cmd_new` in `semperwake` |
 | Docker queue and state paths | `compose.yaml` and `cmd_new` in `semperwake` |
 | Watchdog cadence (90s, 120s) | `entrypoint.sh` defaults and the systemd timer in `install.sh` |
+| Model credentials passed to `claude` (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) | config block and `agent.env` heredoc in `install.sh`, the loop in `claude.sh`, `.env.example` |
 | Which messages expect a reply (`[OWNER-DM]`, `[OWNER-CHAN]`, `[MENTION]`) | `signal-filter.py` and `reply_channel` in `nudger.sh`, both in `install.sh` |
 
 ## Code style
@@ -119,13 +120,13 @@ sed -i '' -e '/<ONE PARAGRAPH/,/>$/d' -e '/<FILL IN/,/>$/d' agents/swtest/BOOTST
 printf 'ANTHROPIC_API_KEY=sk-ant-fake0000000000000000000000000000\nWATCHDOG_BOOT_SECS=20\nWATCHDOG_EVERY_SECS=20\n' >> agents/swtest/.env
 ```
 
-To skip the first-run screens with that fake key, pre-seed the volume before `up`:
+The installer approves the key on start. To skip the other first-run screens, pre-seed the volume
+before `up`:
 
 ```bash
 AGENT=swtest docker compose run --rm -T agent python3 -c '
 import json,os
-k=os.environ["ANTHROPIC_API_KEY"][-20:]
-json.dump({"hasCompletedOnboarding":True,"customApiKeyResponses":{"approved":[k],"rejected":[]}},open(os.path.expanduser("~/.claude.json"),"w"))
+json.dump({"hasCompletedOnboarding":True},open(os.path.expanduser("~/.claude.json"),"w"))
 os.makedirs(os.path.expanduser("~/.claude"),exist_ok=True)
 json.dump({"skipDangerousModePermissionPrompt":True},open(os.path.expanduser("~/.claude/settings.json"),"w"))'
 ./semperwake up swtest

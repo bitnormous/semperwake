@@ -15,6 +15,9 @@ Then describe the agent, and let `check` tell you what's left:
 ./semperwake up alpha
 ```
 
+To use an Anthropic API key instead of a Claude login, set `ANTHROPIC_API_KEY` in the agent's
+`.env` first. `login` is still needed once, to accept the permissions warning.
+
 Use lowercase letters, digits and hyphens for the name. If you already have a folder here, `new`
 adds only what's missing and keeps your files.
 

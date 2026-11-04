@@ -72,6 +72,9 @@ write_env() { # write_env <file> <provider> — only the settings this provider 
         slack)   echo "SLACK_APP_TOKEN="; echo "SLACK_BOT_TOKEN=" ;;
         discord) echo "DISCORD_BOT_TOKEN=" ;;
       esac
+      # Commented, because a blank value would override a key in the shared .env.
+      echo "# Use an API key instead of a Claude login:"
+      echo "#ANTHROPIC_API_KEY=sk-ant-..."
     } > "$1"
   )
 }
@@ -143,7 +146,7 @@ need_value() { # need_value <name> <key> [required prefix]
 }
 
 cmd_check() {
-  local name="$1" dir="$AGENTS/$1" prompt provider rc=0 lines
+  local name="$1" dir="$AGENTS/$1" prompt provider key rc=0 lines
   prompt="$dir/BOOTSTRAP-PROMPT.txt"
   PROBLEMS=0
   say "checking $name"
@@ -174,6 +177,14 @@ cmd_check() {
     *) fail "CHAT_PROVIDER must be none, slack or discord (got '$provider')" ;;
   esac
 
+  # A key that is set but wrong only shows up once the agent tries to think.
+  key="$(cfg "$name" ANTHROPIC_API_KEY)"
+  if [ -n "$key" ]; then
+    [ "${key#sk-ant-}" != "$key" ] \
+      && pass "ANTHROPIC_API_KEY is set" \
+      || warn "ANTHROPIC_API_KEY does not start with sk-ant-: check it is an Anthropic API key"
+  fi
+
   if ! docker info >/dev/null 2>&1; then
     fail "Docker is not running"
   elif ! docker image inspect semperwake:local >/dev/null 2>&1; then
@@ -186,7 +197,7 @@ cmd_check() {
     ' >/dev/null 2>&1 || rc=$?
     case "$rc" in
       0) pass "logged in, and the permissions warning is accepted" ;;
-      3) warn "no Claude login found. Run: ./semperwake login $name" ;;
+      3) warn "no Claude login found. Run: ./semperwake login $name, or set ANTHROPIC_API_KEY" ;;
       4) warn "permissions warning not accepted. Run: ./semperwake login $name" ;;
       *) warn "could not check the login (exit $rc)" ;;
     esac

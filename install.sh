@@ -68,6 +68,10 @@ NUDGE_PATTERN="${NUDGE_PATTERN:-}"
 SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"
+# Whitespace stripped: a pasted key often carries some, and agent.env is sourced
+# unquoted, so one space would break every script that reads it.
+ANTHROPIC_API_KEY="$(printf '%s' "${ANTHROPIC_API_KEY:-}" | tr -d '[:space:]')"   # blank = stored login
+CLAUDE_CODE_OAUTH_TOKEN="$(printf '%s' "${CLAUDE_CODE_OAUTH_TOKEN:-}" | tr -d '[:space:]')"
 # ──────────────────────────────────────────────────────────────
 
 EVENT_JSONL="${EVENT_JSONL:-/tmp/${AGENT}-events.jsonl}"
@@ -154,6 +158,8 @@ INCIDENT_CHANNELS=$INCIDENT_CHANNELS
 SLACK_APP_TOKEN=$SLACK_APP_TOKEN
 SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
 DISCORD_BOT_TOKEN=$DISCORD_BOT_TOKEN
+ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
 EOF
 )
 chmod 600 "$WORKSPACE/agent.env"
@@ -183,9 +189,13 @@ fi
 # ── 3. pre-trust the working directory so claude boots straight to the REPL.
 # Without this the first launch blocks on the folder-trust dialog and the agent
 # never reaches its prompt — it just sits there looking alive.
+#
+# An ANTHROPIC_API_KEY is approved here too. claude asks before using a key from
+# the environment, and the paste's Enter would answer for the human. Putting the key
+# in .env is the owner's answer. claude records keys by their last 20 characters.
 say "pre-trusting $WORKSPACE in ~/.claude.json"
 [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
-WORKSPACE="$WORKSPACE" python3 - <<'PYEOF'
+WORKSPACE="$WORKSPACE" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" python3 - <<'PYEOF'
 import json, os
 p = os.path.expanduser('~/.claude.json')
 try:
@@ -193,10 +203,34 @@ try:
 except Exception:
     d = {}
 d.setdefault('projects', {}).setdefault(os.environ['WORKSPACE'], {})['hasTrustDialogAccepted'] = True
+key = os.environ.get('ANTHROPIC_API_KEY', '').strip()[-20:]
+if key:
+    r = d.setdefault('customApiKeyResponses', {})
+    r['approved'] = [k for k in r.get('approved', []) if k != key] + [key]
+    r['rejected'] = [k for k in r.get('rejected', []) if k != key]
 json.dump(d, open(p, 'w'), indent=2)
 PYEOF
 
 # ── 4. runner: tmux + claude, auto-bootstrap, block until the session dies
+say "writing scripts/claude.sh"
+cat > "$WORKSPACE/scripts/claude.sh" <<'SCRIPT'
+#!/bin/bash
+# What the tmux pane runs: claude, with the model credential from agent.env.
+#
+# It reads the credential here rather than inheriting it from run.sh because a new
+# tmux session takes its environment from the tmux server. When this user already
+# has a server running, run.sh's environment never reaches claude. Only the
+# credential is exported, so natively the bot tokens stay out of every tool claude
+# runs. (In Docker, entrypoint.sh has already exported all of agent.env.)
+set -euo pipefail
+source "${1:?usage: claude.sh <agent.env>}"
+for v in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+    [ -z "${!v:-}" ] || export "$v"
+done
+cd "$WORKSPACE"
+exec "$CLAUDE_BIN" --dangerously-skip-permissions
+SCRIPT
+
 say "writing scripts/run.sh"
 cat > "$WORKSPACE/scripts/run.sh" <<'SCRIPT'
 #!/bin/bash
@@ -220,7 +254,7 @@ fi
 
 log "starting detached tmux '$SESSION' -> claude --dangerously-skip-permissions"
 tmux new-session -d -s "$SESSION" -x 220 -y 60 \
-    "cd '$WORKSPACE' && exec '$CLAUDE_BIN' --dangerously-skip-permissions"
+    "exec '$WORKSPACE/scripts/claude.sh' '$AGENT_ENV'"
 
 # Auto-load the prompt so a crash or reboot self-resumes the loop unattended.
 # 25s because claude renders a splash, checks for updates and loads project
@@ -234,7 +268,7 @@ tmux new-session -d -s "$SESSION" -x 220 -y 60 \
     if [ -n "$(tmux list-clients -t "$SESSION" 2>/dev/null)" ]; then
         log "human attached — skipping auto-bootstrap (run $AGENT-bootstrap by hand)"
     elif tmux capture-pane -p -t "$SESSION" 2>/dev/null \
-            | grep -qiE 'select login method|paste code here|yes, i accept'; then
+            | grep -qiE 'select login method|paste code here|yes, i accept|custom api key'; then
         log "claude is waiting on a human — skipping auto-bootstrap"
     elif tmux has-session -t "$SESSION" 2>/dev/null && [ -f "$BOOTSTRAP_FILE" ]; then
         tmux load-buffer  -t "$SESSION" -b "$AGENT-boot" "$BOOTSTRAP_FILE"
@@ -522,7 +556,7 @@ fi
 PANE="$(tmux capture-pane -p -t "$SESSION" 2>/dev/null || true)"
 
 # 3. login — a human-only fix, so alert rather than thrash the unit
-if printf '%s' "$PANE" | grep -qiE 'invalid api key|/login|please run .*login|authentication_error|credit balance|select login method|paste code here'; then
+if printf '%s' "$PANE" | grep -qiE 'invalid api key|/login|please run .*login|authentication_error|credit balance|select login method|paste code here|custom api key'; then
     alert login-expired "Claude login/credential problem — the agent cannot think until a human runs 'tmux attach -t $SESSION' and re-authenticates" 3600
     exit 0
 fi
@@ -600,7 +634,7 @@ case "\${1:-attach}" in
 esac
 EOF
 chmod 0755 "$BIN/$AGENT-bootstrap" "$BIN/$AGENT-attach"
-chmod 0755 "$WORKSPACE/scripts"/{run.sh,nudger.sh,watchdog.sh,notify.sh,typing.sh}
+chmod 0755 "$WORKSPACE/scripts"/{claude.sh,run.sh,nudger.sh,watchdog.sh,notify.sh,typing.sh}
 
 # ── 9. the signal filter (provider-agnostic; works on the normalized envelope)
 say "writing scripts/signal-filter.py"

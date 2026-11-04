@@ -133,7 +133,52 @@ Neither appears in a stubbed test. Both were found by running the real `claude` 
 
 ```bash
 tmux capture-pane -p -t "$SESSION" \
-  | grep -qiE 'select login method|paste code here|yes, i accept' && alert_a_human
+  | grep -qiE 'select login method|paste code here|yes, i accept|custom api key' && alert_a_human
+```
+
+### A key in the environment isn't a key `claude` will use
+
+Setting `ANTHROPIC_API_KEY` isn't enough. The first time `claude` sees a key, it stops on a question:
+
+```
+Detected a custom API key in your environment
+ANTHROPIC_API_KEY: sk-ant-...00000000000000000000
+Do you want to use this API key?
+  Yes
+❯ No (recommended)
+```
+
+The default is `No`, so the auto-paste's Enter would reject the key, and `claude` would fall back to
+a login the agent may not have. `claude` records its answer by the key's last 20 characters in
+`~/.claude.json`.
+
+**The check:** the installer approves the key from `.env` on every start, which also clears an
+earlier rejection. The screen is also on the human-only list above. To see what `claude` will do with
+the current key, without printing it:
+
+```bash
+AGENT=<name> docker compose exec -T agent sh -c 'python3 -c "
+import json,os
+k=os.environ.get(\"ANTHROPIC_API_KEY\",\"\").strip()[-20:]
+r=json.load(open(os.path.expanduser(\"~/.claude.json\"))).get(\"customApiKeyResponses\",{})
+print(\"no key\" if not k else \"approved\" if k in r.get(\"approved\",[]) else \"rejected\" if k in r.get(\"rejected\",[]) else \"will ask\")"'
+```
+
+### A new tmux session doesn't inherit its caller's environment
+
+In a fresh container a key exported by the runner reaches `claude`: the first `tmux new-session`
+starts the server, and the server copies its caller's environment. Once a server is already running,
+a new session copies the *server's* environment instead. On a native install the agent's user may
+well have tmux open, and then a key exported by the runner would never reach `claude`, with nothing
+in any log to say so.
+
+**The check:** the pane runs `scripts/claude.sh`, which reads the key from `agent.env` itself and then
+`exec`s `claude`. The pane's process is therefore `claude`, and its environment shows whether the key
+arrived. This prints `1`:
+
+```bash
+tr '\0' '\n' < /proc/"$(tmux display -p -t "$SESSION" '#{pane_pid}')"/environ \
+  | grep -c '^ANTHROPIC_API_KEY=.'
 ```
 
 ### The watchdog and the auto-paste can both arm the same session

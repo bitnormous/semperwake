@@ -89,12 +89,14 @@ assert_file "prompt template present"  "$REPO/prompts/BOOTSTRAP-PROMPT.txt"
 assert_file ".env.example shipped"     "$REPO/.env.example"
 grep -q '^\.env$' "$REPO/.gitignore"   && ok ".env is gitignored" || bad ".env is gitignored"
 # .env.example must never ship a populated secret
-grep -qE '^(SLACK_BOT_TOKEN|SLACK_APP_TOKEN|DISCORD_BOT_TOKEN)=.+' "$REPO/.env.example" \
+# A value ending in "..." is a placeholder, such as sk-ant-api03-...
+grep -E '^#?(SLACK_BOT_TOKEN|SLACK_APP_TOKEN|DISCORD_BOT_TOKEN|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=.+' "$REPO/.env.example" \
+  | grep -qvE '\.\.\.$' \
   && bad ".env.example carries no real tokens" || ok ".env.example carries no real tokens"
 # every var the installer reads should be documented in .env.example
 for v in AGENT CHAT_PROVIDER OWNER_ID SELF_BOT_ID OWNER_CHANNELS INCIDENT_CHANNELS \
          IDLE_STALL_SECS NUDGE_COOLDOWN_SECONDS TYPING_MAX_SECS \
-         SLACK_APP_TOKEN SLACK_BOT_TOKEN DISCORD_BOT_TOKEN; do
+         SLACK_APP_TOKEN SLACK_BOT_TOKEN DISCORD_BOT_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
   grep -qE "^#?$v=" "$REPO/.env.example" || bad "$v documented in .env.example"
 done
 ok "all config vars documented in .env.example"
@@ -127,7 +129,7 @@ assert_nofile "NO listener unit"       "$H1/.config/systemd/user/solo-listener.s
 assert_nofile "NO nudger unit"         "$H1/.config/systemd/user/solo-nudger.service"
 assert_nofile "NO listener script"     "$H1/solo/scripts/slack-listener.mjs"
 
-for f in run.sh nudger.sh watchdog.sh notify.sh typing.sh; do
+for f in claude.sh run.sh nudger.sh watchdog.sh notify.sh typing.sh; do
   bash -n "$H1/solo/scripts/$f" && ok "generated $f parses" || bad "generated $f parses"
 done
 bash -n "$H1/.local/bin/solo-bootstrap" && ok "solo-bootstrap parses" || bad "solo-bootstrap parses"
@@ -171,6 +173,41 @@ assert_contains ".env TYPING_MAX_SECS applied"  "$AE" "TYPING_MAX_SECS=45"
 assert_contains ".env OWNER_ID applied"         "$AE" "OWNER_ID=UFROMENV"
 assert_contains ".env OWNER_CHANNELS applied"   "$AE" "OWNER_CHANNELS=CONE,CTWO"
 assert_lacks    "comments not parsed as vars"   "$AE" "a comment"
+assert_contains ".env empty API key recorded" "$AE" "ANTHROPIC_API_KEY="
+python3 -c 'import json,sys; sys.exit("customApiKeyResponses" in json.load(open(sys.argv[1])))' \
+  "$H3/.claude.json" && ok "no API key, nothing approved" || bad "no API key, nothing approved"
+
+# A model API key must reach agent.env and be approved, or claude stops on its
+# "use this API key?" screen. A key the human once rejected must be un-rejected.
+HK="$SANDBOX/hk"; mkdir -p "$HK"
+KEY=sk-ant-api03-fake0000000000000000000000000000
+KTAIL="${KEY: -20}"
+printf '{"customApiKeyResponses":{"approved":["other-key-tail-0000"],"rejected":["%s"]}}' "$KTAIL" > "$HK/.claude.json"
+OUT="$(run_install "$HK" keyed ANTHROPIC_API_KEY="  $KEY " CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fake)"
+assert_contains "install with an API key completes" "$OUT" "Done."
+AE="$(cat "$HK/keyed/agent.env" 2>/dev/null)"
+assert_contains "API key reaches agent.env"     "$AE" "ANTHROPIC_API_KEY=$KEY"
+assert_contains "OAuth token reaches agent.env" "$AE" "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fake"
+R="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["customApiKeyResponses"]; print(r["approved"], r["rejected"])' "$HK/.claude.json")"
+assert_eq "API key approved by its last 20 chars, rejection cleared" "$R" "['other-key-tail-0000', '$KTAIL'] []"
+grep -q hasTrustDialogAccepted "$HK/.claude.json" && ok "approval keeps the trust setting" || bad "approval keeps the trust setting"
+run_install "$HK" keyed ANTHROPIC_API_KEY="$KEY" CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fake >/dev/null
+assert_eq "re-install approves the key once" \
+  "$(grep -o "$KTAIL" "$HK/.claude.json" | wc -l | tr -d ' ')" "1"
+
+# The pane's launcher must export the credential and nothing else from agent.env.
+printf '#!/bin/bash\nenv\n' > "$SANDBOX/fake-claude"; chmod +x "$SANDBOX/fake-claude"
+sed "s|^CLAUDE_BIN=.*|CLAUDE_BIN=$SANDBOX/fake-claude|; s|^SLACK_BOT_TOKEN=.*|SLACK_BOT_TOKEN=xoxb-fake|" \
+  "$HK/keyed/agent.env" > "$SANDBOX/keyed.env"
+R="$(env -i PATH=/usr/bin:/bin bash "$HK/keyed/scripts/claude.sh" "$SANDBOX/keyed.env" 2>&1)"
+assert_contains "launcher exports the API key"     "$R" "ANTHROPIC_API_KEY=$KEY"
+assert_contains "launcher exports the OAuth token" "$R" "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fake"
+assert_lacks "launcher keeps bot tokens from claude" "$R" "xoxb-fake"
+assert_contains "launcher starts claude in the workspace" "$R" "PWD=$HK/keyed"
+R="$(env -i PATH=/usr/bin:/bin bash "$H3/envagent/scripts/claude.sh" \
+       <(sed "s|^CLAUDE_BIN=.*|CLAUDE_BIN=$SANDBOX/fake-claude|" "$H3/envagent/agent.env") 2>&1)"
+assert_lacks "no key, no empty key exported" "$R" "ANTHROPIC_API_KEY"
+
 # shell environment must beat the .env file
 OUT="$(env -i HOME="$SANDBOX/h3b" PATH="$STUB:/usr/local/bin:/usr/bin:/bin" \
        ENV_FILE="$ENVF" AGENT=shellwins WORKSPACE="$SANDBOX/h3b/shellwins" \
@@ -475,6 +512,10 @@ for pane in 'Select login method:' 'Paste code here if prompted >'; do
   assert_lacks "login screen is not re-armed: $pane" "$R" "re-armed"
 done
 rm -rf "$SANDBOX/state-nova/watchdog"
+R="$(wd 'Detected a custom API key in your environment  Do you want to use this API key?')"
+assert_contains "API key question alerts" "$R" "ALERT[login-expired]"
+assert_lacks "API key question is not re-armed" "$R" "re-armed"
+rm -rf "$SANDBOX/state-nova/watchdog"
 R="$(wd 'Bypass Permissions mode  No, exit  Yes, I accept')"
 assert_contains "bypass warning alerts" "$R" "ALERT[bypass-unaccepted]"
 assert_lacks "bypass warning is not re-armed" "$R" "re-armed"
@@ -531,6 +572,11 @@ env AGENT_ENV="$HC/box/agent.env" BOOTSTRAP_DELAY_SECS=0 FAKE_PANE='No, exit  Ye
 RP=$!; sleep 1; kill -TERM -- "-$RP" 2>/dev/null; wait "$RP" 2>/dev/null
 assert_contains "no auto-paste onto a human-only screen" "$(cat "$BL")" "skipping auto-bootstrap"
 assert_lacks "prompt not loaded onto a human-only screen" "$(cat "$BL")" "loop prompt loaded"
+env AGENT_ENV="$HC/box/agent.env" BOOTSTRAP_DELAY_SECS=0 \
+    FAKE_PANE='Detected a custom API key in your environment' \
+    PATH="$STUB:$PATH" setsid bash "$HC/box/scripts/run.sh" > "$BL" 2>&1 &
+RP=$!; sleep 1; kill -TERM -- "-$RP" 2>/dev/null; wait "$RP" 2>/dev/null
+assert_contains "no auto-paste onto the API key question" "$(cat "$BL")" "skipping auto-bootstrap"
 
 entry() { # entry <out> — start the entrypoint in its own process group
   env -i HOME="$HC" PATH="$STUB:/usr/local/bin:/usr/bin:/bin" AGENT=box WORKSPACE="$HC/box" \
@@ -573,6 +619,7 @@ assert_contains "prompt carries the owner"  "$P" "Only Ada Lovelace directs you"
 assert_lacks "prompt paths are substituted" "$P" "<WORKSPACE>"
 assert_eq "agent .env is mode 600" "$(stat -c '%a' "$CLI/agents/alpha/.env")" "600"
 assert_lacks "no chat settings without a provider" "$(cat "$CLI/agents/alpha/.env")" "OWNER_ID"
+assert_contains "API key is offered, commented out" "$(cat "$CLI/agents/alpha/.env")" "#ANTHROPIC_API_KEY="
 
 for name in Bad.Name ../escape UPPER -dash example; do
   assert_contains "new rejects '$name'" "$(sw new "$name")" "error:"
@@ -593,6 +640,15 @@ assert_contains "up refuses a failing agent" "$(sw up alpha)" "problem(s) to fix
 assert_lacks "nothing starts on a failed check" "$(cat "$DL")" "up -d"
 fill "$CLI/agents/alpha/BOOTSTRAP-PROMPT.txt"
 assert_contains "check passes a complete agent" "$(sw check alpha)" "alpha is ready."
+echo "ANTHROPIC_API_KEY=sk-ant-secret-key-value" >> "$CLI/agents/alpha/.env"
+R="$(sw check alpha)"
+assert_contains "check sees the API key" "$R" "ok    ANTHROPIC_API_KEY is set"
+assert_lacks "check never prints the key" "$R" "secret-key-value"
+sed -i 's/^ANTHROPIC_API_KEY=.*/ANTHROPIC_API_KEY=not-a-key/' "$CLI/agents/alpha/.env"
+R="$(sw check alpha)"
+assert_contains "check warns on a malformed key" "$R" "warn  ANTHROPIC_API_KEY does not start with sk-ant-"
+assert_contains "a malformed key does not block the agent" "$R" "alpha is ready."
+sed -i '/^ANTHROPIC_API_KEY=/d' "$CLI/agents/alpha/.env"
 : > "$DL"; sw up alpha >/dev/null
 L="$(cat "$DL")"
 assert_contains "up starts the named agent" "$L" "AGENT=alpha compose"

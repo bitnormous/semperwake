@@ -15,8 +15,15 @@ and debug.
 systemd (Restart=always)
   └── run.sh                     blocks until the session dies
         └── tmux session         detached, 220x60
-              └── claude --dangerously-skip-permissions
+              └── claude.sh          exports the model credential from agent.env
+                    └── claude --dangerously-skip-permissions
 ```
+
+**Why does `claude.sh` read the credential itself?** A new tmux session takes its environment from
+the tmux server, not from the command that created it. If the agent's user already has a tmux
+server running, a key exported by `run.sh` never reaches `claude`. Reading `agent.env` inside the
+pane works either way, and exporting only `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` keeps
+the bot tokens out of `claude`'s environment on a native install.
 
 **Why tmux at all?** Claude Code needs a TTY. More usefully, tmux gives you three things no
 `nohup`/`&` approach does:
@@ -143,6 +150,16 @@ done
 A production agent lost its wake path for about six weeks to exactly this: the blocking happened
 before the first log line, so "silently broken" and "quietly healthy" produced identical output.
 
+**Discord "typing…".** When a message the agent is expected to answer wakes it, the nudger also
+starts `scripts/typing.sh` for that channel. These are the messages `signal-filter.py` tags
+`[OWNER-DM]`, `[OWNER-CHAN]` or `[MENTION]`. `[INCIDENT]` and `[JOB]` often end in silence, and
+"typing…" would promise a reply. The indicator stops when `notify.sh` delivers a reply, or after
+`TYPING_MAX_SECS`. It's cosmetic, so nothing waits for it and its failures are ignored.
+
+**Delivered means confirmed.** `notify.sh` exits 1 unless the provider's reply confirms the post, and
+writes the refused message to `notify.log` as `UNDELIVERED`. curl's exit status can't show a refusal:
+Discord refuses with a 4xx body, and Slack with HTTP 200 and `"ok":false`.
+
 ---
 
 ## 4. The watchdog — five ways an agent dies quietly
@@ -153,7 +170,7 @@ Runs every 2 minutes. Checks are ordered by *how silently* each failure kills th
 |---|---|---|
 | Unit inactive | nothing running | `systemctl start` |
 | tmux session missing while unit active | runner alive, session gone | restart (cooldown-guarded) |
-| Login/credential error in pane | agent can't think | **alert a human — do not restart** |
+| Login/credential error, or the API key question, in pane | agent can't think | **alert a human — do not restart** |
 | Pane byte-identical too long | loop frozen | re-paste prompt, else restart |
 | Pane has no loop markers | bare `claude`, no prompt | re-paste prompt |
 
@@ -171,6 +188,12 @@ sleeping agent every few minutes — a self-inflicted outage that looks exactly 
 **Why does an expired login alert instead of restarting?** Restarting cannot fix credentials. It
 produces a restart loop that buries the one message explaining the silence. Some failures are
 human-only, and a watchdog that can't tell the difference makes them worse.
+
+**Why does the installer approve the API key?** `claude` asks before using an `ANTHROPIC_API_KEY`
+from its environment, and the question defaults to `No`. Putting the key in `.env` is the owner's
+answer, so the installer records it in `~/.claude.json` on every start, by the key's last 20
+characters as `claude` does. The bypass-permissions warning is different: it accepts a risk rather
+than naming a credential, so a human must always answer it.
 
 **Restart guard.** At most one self-heal per hour:
 
@@ -264,6 +287,12 @@ was refused and a fresh identify is required.
 It also validates `SELF_BOT_ID` against the id Discord reports at `READY`, and warns on mismatch —
 otherwise mention detection and echo-dropping both silently do nothing, and the agent starts
 answering itself.
+
+**A role mention counts as a mention.** Discord gives every bot a managed role with the bot's name,
+and people often pick that role from the `@` menu instead of the bot. The message then lists the
+role in `mention_roles` and leaves `mentions` empty. The listener learns the bot's own role from
+`GUILD_CREATE`, where `tags.bot_id` equals `SELF_BOT_ID`, and keeps it current from
+`GUILD_ROLE_CREATE` and `GUILD_ROLE_UPDATE`. Without `SELF_BOT_ID` it can't recognise the role.
 
 ### The signal filter
 
