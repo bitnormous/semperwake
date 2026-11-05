@@ -162,7 +162,7 @@ Discord refuses with a 4xx body, and Slack with HTTP 200 and `"ok":false`.
 
 ---
 
-## 4. The watchdog — five ways an agent dies quietly
+## 4. The watchdog — the ways an agent dies quietly
 
 Runs every 2 minutes. Checks are ordered by *how silently* each failure kills the agent.
 
@@ -171,6 +171,9 @@ Runs every 2 minutes. Checks are ordered by *how silently* each failure kills th
 | Unit inactive | nothing running | `systemctl start` |
 | tmux session missing while unit active | runner alive, session gone | restart (cooldown-guarded) |
 | Login/credential error, or the API key question, in pane | agent can't think | **alert a human — do not restart** |
+| Usage limit in pane | agent can't think until the reset | alert once, pause, wake after the reset |
+| API error after `claude`'s own retries | turn ended, loop not rescheduled | wake with backoff; alert after `API_ERROR_ALERT_AFTER` |
+| Context full | every request fails | `/compact`, then a guarded restart |
 | Pane byte-identical too long | loop frozen | re-paste prompt, else restart |
 | Pane has no loop markers | bare `claude`, no prompt | re-paste prompt |
 
@@ -188,6 +191,15 @@ sleeping agent every few minutes — a self-inflicted outage that looks exactly 
 **Why does an expired login alert instead of restarting?** Restarting cannot fix credentials. It
 produces a restart loop that buries the one message explaining the silence. Some failures are
 human-only, and a watchdog that can't tell the difference makes them worse.
+
+**When `claude` can't think, nothing types the prompt again.** A usage limit, a failed request and a
+full context all leave a live session whose pane can look frozen or un-armed. Re-pasting the prompt
+fixes none of them, and its first step skips the queue backlog, so `scripts/claude-state.sh` checks
+for them first. At a usage limit the nudger stops pressing keys, because Enter in `claude`'s limit
+menu picks whatever option is highlighted. It leaves events in the queue and sends each waiting
+sender one message saying why. The watchdog wakes the agent a minute after the reset time `claude`
+printed, using `scripts/wake.sh`, which closes the menu with Escape first and won't press Enter if it
+stays open. After repeated API errors, new senders hear that their reply may be late.
 
 **Why does the installer approve the API key?** `claude` asks before using an `ANTHROPIC_API_KEY`
 from its environment, and the question defaults to `No`. Putting the key in `.env` is the owner's

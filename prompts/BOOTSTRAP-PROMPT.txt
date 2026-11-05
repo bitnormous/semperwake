@@ -94,6 +94,9 @@ queue. Treat EVERY "." as a hard directive to:
 - Cap one iteration at ~2 minutes of wall clock. If you are mid-command at the cap, finish it and
   stop. Long-running work goes into a backgrounded bash invocation, never the loop body.
 - A "no new events" iteration should cost seconds: check cursor, check filter, schedule, done.
+- During a usage limit or an API outage you are paused, events wait in the queue, and their senders
+  get one automatic notice. A wake afterwards can bring a backlog hours old: answer every message,
+  oldest first, and say briefly that the reply was delayed.
 
 MEASUREMENT DISCIPLINE — these are the errors that actually cost incidents. They are mechanical
 controls, not reminders to be careful. Naming a failure mode provides zero protection against

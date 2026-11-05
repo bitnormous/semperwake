@@ -193,6 +193,33 @@ again.
 tmux display-message -p -t "$SESSION" '#{session_created}'
 ```
 
+### A usage limit looks like a quiet agent, and every remedy makes it worse
+
+At a usage limit `claude` is alive, its session exists, and its pane changes whenever a nudge
+lands. Every check passes, and nobody hears back. The default remedies make it worse:
+
+- A nudge types `.` and Enter into whatever `claude` shows. Claude Code 2.1 can show a menu at a
+  limit, with options such as "Add funds to continue" and "Upgrade your plan" next to "Stop and wait
+  for limit to reset", and Enter picks whichever option is highlighted.
+- The frozen-pane and un-armed checks re-paste the prompt. Its first step moves the cursor to the end
+  of the queue, so the messages that arrived during the limit are never answered.
+
+A request that still fails after `claude`'s own retries (`API Error: 529`, a timeout) is quieter
+still. The turn ends before the agent schedules its next wake, so the loop stops until something
+else wakes it.
+
+**The check:** `scripts/claude-state.sh` reads the end of the pane the way the nudger and the
+watchdog do. Anything but `ok` means the agent can't think, whatever else reports healthy:
+
+```bash
+AGENT_ENV=<workspace>/agent.env <workspace>/scripts/claude-state.sh
+# limited  1793890860  3pm (Europe/London)  474d08d42f06fc35
+```
+
+It matches the wording of Claude Code 2.1, which isn't a stable interface. The tests cover it with
+stubbed panes and a real tmux pane printing the same text, not a real limit. If a limit goes by
+without a `held for the usage limit` line in the nudger's log, check the wording first.
+
 ---
 
 ## Family 2 — the agent is confidently wrong about its own numbers

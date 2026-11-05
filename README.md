@@ -470,6 +470,9 @@ shared one. [.env.example](.env.example) documents every model, chat and pacing 
 | `NUDGE_COOLDOWN_SECONDS` | `15` | One burst of events causes one wake within this window |
 | `NUDGE_PATTERN` | blank | Extra regex for queue lines worth waking for |
 | `TYPING_MAX_SECS` | `120` | Discord only: the longest the bot shows "typing…" for one message. `0` turns it off |
+| `USAGE_LIMIT_RETRY_SECS` | `1800` | At a usage limit with no reset time on screen, how long to wait before trying again |
+| `API_ERROR_WAKE_SECS` | `300` | Wait after a failed request before waking the agent to retry. Doubles each time, up to an hour |
+| `API_ERROR_ALERT_AFTER` | `3` | Failed retries before you're alerted and new senders hear their reply may be late |
 
 These apply to Docker only:
 
@@ -572,6 +575,10 @@ Start with `./semperwake check <name>`, and then `./semperwake logs <name>`.
 | `ALERT[login-expired]` | Claude is logged out, or the key is invalid or unapproved | Run `./semperwake login <name>`, or fix `ANTHROPIC_API_KEY`, then `./semperwake restart <name>` |
 | `check` warns `ANTHROPIC_API_KEY does not start with sk-ant-` | Another kind of key was pasted | Copy an API key from console.anthropic.com, then restart |
 | `ALERT[bypass-unaccepted]` | The permissions warning hasn't been accepted | Run `./semperwake attach <name>` and choose **Yes, I accept**. The watchdog re-arms it within about 2 minutes |
+| `ALERT[usage-limit]` | Claude's usage limit is reached | Nothing. Senders get an automatic reply, messages wait in the queue, and the agent resumes after the reset time in the alert |
+| `ALERT[limit-menu]` | Claude's limit menu didn't close after the reset | Run `./semperwake attach <name>` and choose **Stop and wait for limit to reset** |
+| `ALERT[api-errors]` | Requests keep failing after Claude's own retries | Usually an outage that passes. The watchdog keeps retrying, with longer waits each time. Check status.anthropic.com |
+| `ALERT[context-full]` | The conversation outgrew the context, and `/compact` didn't help | The agent was restarted. Its memory files carry over, but messages that arrived during the restart are skipped |
 | The agent is up but idle | The prompt didn't load | Run `AGENT=<name> docker compose exec agent <name>-bootstrap`, or restart it |
 | Discord messages arrive empty | Message Content Intent is off | Enable it in the Discord developer portal |
 | The agent replies to itself | `SELF_BOT_ID` is empty or wrong | Set it to the bot's user ID, then restart |
@@ -678,6 +685,8 @@ scripts/nudger.sh             debounced wake on actionable events
 scripts/watchdog.sh           liveness checks
 scripts/notify.sh             provider-agnostic "send a message"
 scripts/typing.sh             Discord "typing…" until the agent replies
+scripts/claude-state.sh       can claude think? ok, usage limit, API error or full context
+scripts/wake.sh               the "." wake, safe to send into claude's usage-limit menu
 scripts/signal-filter.py      firehose → tagged signal
 scripts/<provider>-listener.mjs   installed only for Slack or Discord
 ```
@@ -698,6 +707,7 @@ everything in a throwaway `HOME`, and asserts real behaviour:
 - signal-filter tagging across mixed providers, and cursor semantics under rotation
 - nudge debounce under burst, notify routing per provider, and the Discord typing indicator
 - every watchdog path, including alert dedupe
+- usage limits, API errors and a full context: held wakes, automatic replies, backoff and resume
 - container supervision and the `semperwake` command
 
 It never touches your systemd, your network or your real agent, and section 12 asserts that.

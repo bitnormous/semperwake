@@ -50,7 +50,7 @@ The first image build takes several minutes. `docker build` needs no buildx.
 
 ### Generated files: edit the source
 
-`claude.sh`, `run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `typing.sh`, `signal-filter.py`, the listeners and the
+`claude.sh`, `run.sh`, `nudger.sh`, `watchdog.sh`, `notify.sh`, `typing.sh`, `claude-state.sh`, `wake.sh`, `signal-filter.py`, the listeners and the
 `<agent>-attach` and `<agent>-bootstrap` helpers **do not exist in this repo as files**. They are
 heredocs in `install.sh`, written to `<workspace>/scripts/` and `~/.local/bin/` at install time.
 
@@ -83,13 +83,14 @@ Nothing enforces these except tests and care, so change every location together:
 |---|---|
 | Prompt placeholders `<OWNER_NAME\|FILL IN\|ONE PARAGRAPH>` | `PLACEHOLDERS` in `semperwake`, `placeholders` in `docker/entrypoint.sh`, the template, and the `fill` helper and `sed` in tests |
 | Human-only screens: `select login method`, `paste code here`, `yes, i accept`, `custom api key` | `run.sh` and `watchdog.sh`, both in `install.sh` |
-| Paste delay (25s) must stay below the watchdog's boot grace (60s) | `run.sh` and check 5 in `watchdog.sh` |
+| Paste delay (25s) must stay below the watchdog's boot grace (60s) | `run.sh` and check 6 in `watchdog.sh` |
 | `IDLE_STALL_SECS` (2400) must exceed the longest idle wake (600s) | `.env.example`, `install.sh`, the prompt |
 | Template substitutions | `install.sh` step 2 and `cmd_new` in `semperwake` |
 | Docker queue and state paths | `compose.yaml` and `cmd_new` in `semperwake` |
 | Watchdog cadence (90s, 120s) | `entrypoint.sh` defaults and the systemd timer in `install.sh` |
 | Model credentials passed to `claude` (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) | config block and `agent.env` heredoc in `install.sh`, the loop in `claude.sh`, `.env.example` |
 | Which messages expect a reply (`[OWNER-DM]`, `[OWNER-CHAN]`, `[MENTION]`) | `signal-filter.py` and `reply_channel` in `nudger.sh`, both in `install.sh` |
+| Claude Code's usage-limit menu text (`stop and wait for limit to reset`) | `LIMIT` in `claude-state.sh` and `MENU` in `wake.sh`, both in `install.sh` |
 
 ## Code style
 

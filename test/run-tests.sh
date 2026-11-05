@@ -96,6 +96,7 @@ grep -E '^#?(SLACK_BOT_TOKEN|SLACK_APP_TOKEN|DISCORD_BOT_TOKEN|ANTHROPIC_API_KEY
 # every var the installer reads should be documented in .env.example
 for v in AGENT CHAT_PROVIDER OWNER_ID SELF_BOT_ID OWNER_CHANNELS INCIDENT_CHANNELS \
          IDLE_STALL_SECS NUDGE_COOLDOWN_SECONDS TYPING_MAX_SECS \
+         USAGE_LIMIT_RETRY_SECS API_ERROR_WAKE_SECS API_ERROR_ALERT_AFTER \
          SLACK_APP_TOKEN SLACK_BOT_TOKEN DISCORD_BOT_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
   grep -qE "^#?$v=" "$REPO/.env.example" || bad "$v documented in .env.example"
 done
@@ -129,7 +130,7 @@ assert_nofile "NO listener unit"       "$H1/.config/systemd/user/solo-listener.s
 assert_nofile "NO nudger unit"         "$H1/.config/systemd/user/solo-nudger.service"
 assert_nofile "NO listener script"     "$H1/solo/scripts/slack-listener.mjs"
 
-for f in claude.sh run.sh nudger.sh watchdog.sh notify.sh typing.sh; do
+for f in claude.sh run.sh nudger.sh watchdog.sh notify.sh typing.sh claude-state.sh wake.sh; do
   bash -n "$H1/solo/scripts/$f" && ok "generated $f parses" || bad "generated $f parses"
 done
 bash -n "$H1/.local/bin/solo-bootstrap" && ok "solo-bootstrap parses" || bad "solo-bootstrap parses"
@@ -363,6 +364,48 @@ assert_eq "the wake sends a literal dot"       "$(grep -c '^\.$' "$SK")" "1"
 assert_eq "4 of the burst debounced"           "$(grep -c debounced "$SANDBOX/nudger.out")" "4"
 assert_lacks "noise did not wake the agent"    "$(cat "$SANDBOX/nudger.out")" "pure chatter"
 
+# At a usage limit a wake would only type into claude's limit menu. The event must
+# wait in the queue, and its sender must hear why, once, instead of nothing.
+LIMITED="You've hit your limit · resets Dec 31, 2099, 3pm (UTC)"
+LJ="$SANDBOX/limit-events.jsonl"; LENV="$SANDBOX/limit.env"; LCL="$SANDBOX/limit-curl.log"
+: > "$LJ"; : > "$LCL"; : > "$SK"; rm -rf "$SANDBOX/state-nova/nudger" "$SANDBOX/state-nova/claude"
+sed "s|^EVENT_JSONL=.*|EVENT_JSONL=$LJ|" "$W/agent.env" > "$LENV"
+( export AGENT_ENV="$LENV" SENDKEYS_LOG="$SK" PATH="$STUB:$PATH" CURL_LOG="$LCL" FAKE_PANE="$LIMITED"
+  bash "$W/scripts/nudger.sh" > "$SANDBOX/limit-nudger.out" 2>&1 ) &
+NP=$!
+sleep 1
+for i in 1 2; do
+  echo "{\"provider\":\"slack\",\"kind\":\"message\",\"channel\":\"DDM\",\"channel_type\":\"dm\",\"user\":\"UTESTOWNER\",\"text\":\"limited $i\"}" >> "$LJ"
+  sleep 1
+done
+echo '{"provider":"slack","kind":"message","channel":"CNOISE","channel_type":"channel","user":"UTESTOWNER","text":"unwatched","mentions_self":false}' >> "$LJ"
+echo '{"kind":"job","job":"daily"}' >> "$LJ"
+sleep 2
+kill $NP 2>/dev/null; wait $NP 2>/dev/null
+LOUT="$(cat "$SANDBOX/limit-nudger.out")"
+assert_eq "no keys reach claude at a usage limit" "$(wc -l < "$SK" | tr -d ' ')" "0"
+assert_contains "a limited event is held"          "$LOUT" "held for the usage limit"
+assert_eq "the sender is told once, not per message" "$(grep -c 'chat.postMessage' "$LCL")" "1"
+assert_contains "the reply names the limit and the reset" "$(cat "$LCL")" "usage limit"
+assert_contains "the reply quotes claude's reset time"    "$(cat "$LCL")" "Dec 31, 2099, 3pm (UTC)"
+assert_contains "the reply goes to the sender's channel"  "$(cat "$LCL")" '"channel":"DDM"'
+assert_lacks "a job gets no automatic reply" "$(grep -v DDM "$LCL")" "postMessage"
+
+# When requests keep failing, the wake still goes ahead (it is also the retry), and the
+# sender hears the reply may be late.
+: > "$LCL"; : > "$SK"; rm -rf "$SANDBOX/state-nova/nudger"
+mkdir -p "$SANDBOX/state-nova/claude"; printf '1700000000\nAPI Error: 529 overloaded\n' > "$SANDBOX/state-nova/claude/degraded"
+( export AGENT_ENV="$LENV" SENDKEYS_LOG="$SK" PATH="$STUB:$PATH" CURL_LOG="$LCL"
+  bash "$W/scripts/nudger.sh" > "$SANDBOX/limit-nudger.out" 2>&1 ) &
+NP=$!
+sleep 1
+echo '{"provider":"slack","kind":"message","channel":"DDM","channel_type":"dm","user":"UTESTOWNER","text":"degraded"}' >> "$LJ"
+sleep 2
+kill $NP 2>/dev/null; wait $NP 2>/dev/null
+assert_eq "a degraded agent is still woken" "$(grep -c '^\.$' "$SK")" "1"
+assert_contains "the sender hears the reply may be late" "$(cat "$LCL")" "trouble reaching Claude"
+rm -rf "$SANDBOX/state-nova/claude" "$SANDBOX/state-nova/nudger"; : > "$SK"
+
 # notify must resolve + cache a DM channel per provider, and never hit the real network
 CL="$SANDBOX/curl.log"; : > "$CL"
 env AGENT_ENV="$W/agent.env" PATH="$STUB:$PATH" CURL_LOG="$CL" \
@@ -525,6 +568,73 @@ rm -rf "$SANDBOX/state-nova/watchdog"
 wd 'Invalid API key · Please run /login' >/dev/null
 assert_contains "repeat alert is deduped" \
   "$(wd 'Invalid API key · Please run /login')" "deduped"
+
+# claude is running but can't think. Re-pasting the prompt would skip the queue
+# backlog, so none of these may reach the re-arm or restart paths by accident.
+wdclean() { rm -rf "$SANDBOX/state-nova/watchdog" "$SANDBOX/state-nova/claude"; : > "$SK"; }
+wdclean
+R="$(wd "You've hit your limit · resets Dec 31, 2099, 3pm (UTC)")"
+assert_contains "a usage limit alerts with the reset time" "$R" "resets Dec 31, 2099, 3pm (UTC)"
+assert_contains "a usage limit pauses the agent"           "$R" "paused until 2099-12-31"
+assert_eq "a paused agent gets no keys"                    "$(wc -l < "$SK" | tr -d ' ')" "0"
+assert_lacks "a paused agent is not re-armed"              "$R" "bootstrap"
+assert_lacks "the same limit alerts once" \
+  "$(wd "You've hit your limit · resets Dec 31, 2099, 3pm (UTC)")" "ALERT"
+wdclean
+R="$(wd 'Claude AI usage limit reached|4102444800')"
+assert_contains "the old epoch format is read" "$R" "paused until 2100-01-01"
+wdclean
+R="$(wd 'Usage limit reached')"
+assert_contains "a limit with no time still pauses" "$R" "paused until"
+wdclean
+R="$(wd 'the vendor said usage limit reached yesterday, nova loop idle')"
+assert_contains "the agent's own prose is not a limit" "$R" "ok"
+
+wdclean
+R="$(wd 'Usage limit reached · limit resets Jan 1, 2020, 3pm (UTC)')"
+assert_contains "after the reset the agent is woken" "$R" "woke the agent"
+assert_eq "the wake is a dot and Enter" "$(tr '\n' ' ' < "$SK")" ". Enter "
+assert_contains "the owner hears it resumed" "$(tail -n 3 "$SANDBOX/curl.log")" "limit has reset"
+: > "$SK"
+R="$(wd 'Usage limit reached · limit resets Jan 1, 2020, 3pm (UTC)
+nova loop idle')"
+assert_eq "a handled limit message is not acted on twice" "$(wc -l < "$SK" | tr -d ' ')" "0"
+
+# Enter in claude's limit menu picks the highlighted option, and some spend money
+wdclean
+R="$(wd "Usage limit reached · limit resets Jan 1, 2020, 3pm (UTC)
+❯ 1. Stop and wait for limit to reset
+  2. Add funds to continue with usage credits")"
+assert_eq "a stuck limit menu gets Escape and never Enter" "$(tr '\n' ' ' < "$SK")" "Escape "
+assert_contains "a stuck limit menu alerts" "$R" "ALERT[limit-menu]"
+
+wdclean
+AE="$SANDBOX/agent.env.apierr"
+sed -e 's/^API_ERROR_WAKE_SECS=.*/API_ERROR_WAKE_SECS=0/' -e 's/^API_ERROR_ALERT_AFTER=.*/API_ERROR_ALERT_AFTER=2/' \
+    "$W/agent.env" > "$AE"
+R="$(wd '  ⎿  API Error: 529 overloaded_error' "$AE")"
+assert_contains "an API error wakes claude to retry" "$R" "try 1"
+assert_lacks "one API error doesn't alert"           "$R" "ALERT"
+R="$(wd '  ⎿  API Error: 529 overloaded_error
+  ⎿  API Error: 529 overloaded_error' "$AE")"
+assert_contains "repeated API errors alert" "$R" "ALERT[api-errors]"
+assert_file "repeated API errors mark the agent degraded" "$SANDBOX/state-nova/claude/degraded"
+wdclean
+R="$(wd '  ⎿  API Error: 529 overloaded_error')"
+assert_contains "the default waits before retrying" "$R" "Waking it in"
+assert_eq "no keys before the wait is over" "$(wc -l < "$SK" | tr -d ' ')" "0"
+wdclean
+assert_contains "a server-side throttle is an API error, not a usage limit" \
+  "$(wd 'Server is temporarily limiting requests (not your usage limit)')" "Waking it in"
+
+wdclean
+R="$(wd '  ⎿  API Error: 400 prompt is too long: 210000 tokens > 200000 maximum')"
+assert_contains "a full context is compacted" "$R" "compacting"
+assert_contains "compaction types /compact"   "$(cat "$SK")" "/compact"
+R="$(wd 'Conversation too long. Press esc twice to go up a few messages and try again.')"
+assert_contains "a failed compaction alerts"     "$R" "ALERT[context-full]"
+assert_contains "a failed compaction restarts"   "$R" "restarting"
+wdclean
 
 # ═════════════════════════ 10. container supervision ═════════════════════════
 section "10. Container supervision (SUPERVISOR=container)"

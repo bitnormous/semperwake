@@ -58,6 +58,9 @@ CHAT_PROVIDER="${CHAT_PROVIDER:-${EVENT_SOURCE:-none}}"   # none | slack | disco
 IDLE_STALL_SECS="${IDLE_STALL_SECS:-2400}"
 NUDGE_COOLDOWN_SECONDS="${NUDGE_COOLDOWN_SECONDS:-15}"
 TYPING_MAX_SECS="${TYPING_MAX_SECS:-120}"
+USAGE_LIMIT_RETRY_SECS="${USAGE_LIMIT_RETRY_SECS:-1800}"
+API_ERROR_WAKE_SECS="${API_ERROR_WAKE_SECS:-300}"
+API_ERROR_ALERT_AFTER="${API_ERROR_ALERT_AFTER:-3}"
 OWNER_ID="${OWNER_ID:-${OWNER_SLACK_USER:-}}"
 SELF_BOT_ID="${SELF_BOT_ID:-}"
 OWNER_DM_CHANNEL="${OWNER_DM_CHANNEL:-}"
@@ -148,6 +151,9 @@ IDLE_STALL_SECS=$IDLE_STALL_SECS
 NUDGE_COOLDOWN_SECONDS=$NUDGE_COOLDOWN_SECONDS
 NUDGE_PATTERN=$NUDGE_PATTERN
 TYPING_MAX_SECS=$TYPING_MAX_SECS
+USAGE_LIMIT_RETRY_SECS=$USAGE_LIMIT_RETRY_SECS
+API_ERROR_WAKE_SECS=$API_ERROR_WAKE_SECS
+API_ERROR_ALERT_AFTER=$API_ERROR_ALERT_AFTER
 CHAT_PROVIDER=$CHAT_PROVIDER
 OWNER_ID=$OWNER_ID
 SELF_BOT_ID=$SELF_BOT_ID
@@ -391,6 +397,167 @@ done
 rm -f "$MARK"
 SCRIPT
 
+# ── 5b. claude's own state: can it think right now? Shared by the nudger and watchdog
+say "writing scripts/claude-state.sh"
+cat > "$WORKSPACE/scripts/claude-state.sh" <<'SCRIPT'
+#!/bin/bash
+# claude-state.sh — can claude think right now? Prints one tab-separated line:
+#
+#   <state>  <reset epoch or 0>  <detail or ->  <signatures or ->
+#
+#   ok            nothing below
+#   limited       a usage limit. Detail is the reset time as claude printed it
+#   context-full  the conversation no longer fits. Detail is claude's message
+#   api-error     a request failed after claude's own retries. Detail is the message
+#
+# The nudger asks before it presses keys and the watchdog asks on every pass, so both
+# judge the pane the same way. Only the last lines count, and only lines that start
+# with one of claude's own messages: the agent's prose can mention "usage limit
+# reached" too. A line the watchdog has acted on is listed in claude/handled and
+# skipped, because an old limit message stays on screen after the limit lifts, and
+# acting on it again would pause an agent that is working.
+set -uo pipefail
+source "${AGENT_ENV:?AGENT_ENV not set}"
+DIR="${STATE_DIR:-/tmp/$AGENT-state}/claude"; mkdir -p "$DIR"
+# The whole history, not the screen: a line's signature counts the identical lines
+# before it, so a second "resets 3pm" after a wake is a new event, not the old one.
+tmux capture-pane -p -S - -t "$SESSION" 2>/dev/null \
+  | python3 -c '
+import hashlib, os, re, sys, time
+from datetime import datetime, timedelta
+state_dir, retry = sys.argv[1], int(sys.argv[2])
+now = int(time.time())
+
+# Wording from Claude Code 2.1. It is not a stable interface: if claude changes it,
+# these stop matching and the agent falls back to the frozen-pane check.
+LIMIT = re.compile(r"^[^A-Za-z]*(you.ve hit your limit|usage limit reached|claude (ai )?usage limit reached"
+                   r"|your limit will reset|you.re out of (usage credits|extra usage)"
+                   r"|stop and wait for limit to reset)", re.I)
+ERROR = re.compile(r"^[^A-Za-z]*(api error|prompt is too long|conversation too long|request timed out"
+                   r"|repeated 529|server is temporarily limiting requests|connection error)", re.I)
+FULL  = re.compile(r"prompt is too long|conversation too long", re.I)
+
+lines = sys.stdin.buffer.read().decode("utf-8", "replace").splitlines()
+seen, sigs = {}, []
+for l in lines:
+    t = l.strip()
+    seen[t] = seen.get(t, 0) + 1
+    sigs.append(hashlib.md5(("%s|%d" % (t, seen[t])).encode()).hexdigest()[:16])
+try:
+    handled = set(open(os.path.join(state_dir, "handled")).read().split())
+except OSError:
+    handled = set()
+tail = [i for i, l in enumerate(lines) if l.strip()][-20:]
+hits = [i for i in tail if sigs[i] not in handled and (LIMIT.search(lines[i]) or ERROR.search(lines[i]))]
+
+def out(state, until=0, detail="-", keys="-"):
+    detail = re.sub(r"\s+", " ", detail).strip()[:200] or "-"
+    sys.stdout.buffer.write(("%s\t%d\t%s\t%s\n" % (state, until, detail, keys)).encode())
+    sys.exit(0)
+
+if not hits:
+    out("ok")
+keys = ",".join(sigs[i] for i in hits)
+last = lines[hits[-1]]
+limits = [lines[i] for i in hits if LIMIT.search(lines[i])]
+if not limits:
+    out("context-full" if FULL.search(last) else "api-error", 0, re.sub(r"^[^A-Za-z]*", "", last), keys)
+
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+WHEN = re.compile(r"(?:resets?|automatically)\s+(?:at\s+)?((?:([A-Z][a-z]{2})\s+(\d{1,2})(?:,\s*(\d{4}))?,?\s+(?:at\s+)?)?"
+                  r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([^)]+)\))?)", re.I)
+
+def reset_at(text):
+    """The reset as an epoch, or None. Claude prints local time, with a zone name in brackets when
+    it knows one, and adds the date when the reset is more than a day away."""
+    m = re.search(r"\|(\d{10})\b", text)   # older clients: "Claude AI usage limit reached|<epoch>"
+    if m:
+        return int(m.group(1)), ""
+    m = WHEN.search(text)
+    if not m:
+        return None
+    label, mon, day, year, hour, minute, ampm, zone = m.groups()
+    tz = None
+    if zone:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(zone)
+        except Exception:
+            tz = None
+    current = datetime.now(tz) if tz else datetime.now().astimezone()
+    h = int(hour) % 12 + (12 if ampm.lower() == "pm" else 0)
+    try:
+        if mon:
+            when = current.replace(year=int(year or current.year), month=MONTHS.index(mon.lower()[:3]) + 1,
+                                   day=int(day), hour=h, minute=int(minute or 0), second=0, microsecond=0)
+            if not year and when < current - timedelta(days=1):
+                when = when.replace(year=when.year + 1)
+        else:
+            when = current.replace(hour=h, minute=int(minute or 0), second=0, microsecond=0)
+            # A time with no date is today or tomorrow. One that passed in the last few hours is
+            # an old message for a limit that has already lifted, not one a day away.
+            if when < current - timedelta(hours=6):
+                when += timedelta(days=1)
+    except ValueError:
+        return None
+    return int(when.timestamp()) + 60, label   # a minute late beats a wake into the limit
+
+found = None
+for l in reversed(limits):
+    found = reset_at(l)
+    if found:
+        break
+if found:
+    out("limited", found[0], found[1], keys)
+# No time to read, so retry later. The first sighting fixes the retry time, or every
+# pass would push it back.
+memo = os.path.join(state_dir, "limit-until")
+try:
+    k, until = open(memo).read().split()
+    if k == keys:
+        out("limited", int(until), "-", keys)
+except (OSError, ValueError):
+    pass
+with open(memo + ".tmp", "w") as f:
+    f.write("%s %d\n" % (keys, now + retry))
+os.replace(memo + ".tmp", memo)
+out("limited", now + retry, "-", keys)
+' "$DIR" "${USAGE_LIMIT_RETRY_SECS:-1800}"
+SCRIPT
+
+say "writing scripts/wake.sh"
+cat > "$WORKSPACE/scripts/wake.sh" <<'SCRIPT'
+#!/bin/bash
+# wake.sh — send the "." wake signal into claude's pane. Exit 1 if it can't.
+#
+# claude can be showing its usage-limit menu. Enter there picks the highlighted
+# option, and the options include "Add funds to continue" and "Upgrade your plan",
+# so the menu is closed with Escape first, and nothing is typed if it stays open.
+set -uo pipefail
+source "${AGENT_ENV:?AGENT_ENV not set}"
+MENU='stop and wait for limit to reset'
+# Blank lines dropped first: the capture is the whole screen, so on a pane that isn't
+# full the last rows are empty and a plain tail would never see the menu.
+menu_open() {
+    tmux capture-pane -p -t "$SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 30 | grep -qi "$MENU"
+}
+
+tmux has-session -t "$SESSION" 2>/dev/null || exit 1
+if menu_open; then
+    tmux send-keys -t "$SESSION" Escape
+    sleep 1
+    if menu_open; then
+        echo "wake: claude's usage-limit menu is still open; not pressing Enter" >&2
+        exit 1
+    fi
+fi
+# Two calls, not one: `send-keys "." Enter` races Claude's input buffering
+# and the "." can be swallowed, leaving a bare Enter that does nothing.
+tmux send-keys -t "$SESSION" "."
+sleep 0.1
+tmux send-keys -t "$SESSION" Enter
+SCRIPT
+
 # ── 6. nudger: this is what makes the agent real-time rather than a poller
 say "writing scripts/nudger.sh"
 cat > "$WORKSPACE/scripts/nudger.sh" <<'SCRIPT'
@@ -409,6 +576,7 @@ set -uo pipefail
 source "${AGENT_ENV:?AGENT_ENV not set}"
 STATE="${STATE_DIR:-/tmp/$AGENT-state}/nudger"; mkdir -p "$STATE"
 LAST="$STATE/last-nudge"
+DEGRADED="${STATE_DIR:-/tmp/$AGENT-state}/claude/degraded"   # written by the watchdog
 log() { echo "$(date -u +%FT%TZ) [$AGENT-nudger] $*"; }
 # State survives a restart. A lock left by a killed typing.sh would otherwise block
 # that channel for good, and clearing the markers stops any loop still running.
@@ -431,29 +599,60 @@ nudge() { # nudge <why>
     fi
     tmux has-session -t "$SESSION" 2>/dev/null || { log "no session — cannot nudge"; return; }
     echo "$now" > "$LAST"
-    # Two calls, not one: `send-keys "." Enter` races Claude's input buffering
-    # and the "." can be swallowed, leaving a bare Enter that does nothing.
-    tmux send-keys -t "$SESSION" "."
-    sleep 0.1
-    tmux send-keys -t "$SESSION" Enter
-    log "nudged: $1"
+    if AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/wake.sh"; then log "nudged: $1"
+    else log "could not wake claude: $1"; fi
 }
 
-# The Discord channel to show "typing…" in, or nothing. Only for what signal-filter.py
-# tags [OWNER-DM], [OWNER-CHAN] or [MENTION], which the agent is expected to answer: an
-# [INCIDENT] or [JOB] often ends in silence, and "typing…" would promise a reply. The
-# id becomes a file name and part of a URL, so anything but digits is refused.
+# The channel of a message someone is waiting on a reply to, or nothing. Only what
+# signal-filter.py tags [OWNER-DM], [OWNER-CHAN] or [MENTION], which the agent is
+# expected to answer: an [INCIDENT] or [JOB] often ends in silence, and "typing…" or an
+# automatic reply would promise one. The id becomes a file name and part of a URL, so
+# only the provider's own id format passes.
 reply_channel() { # reply_channel <event line>
     printf '%s' "$1" | python3 -c '
-import json,sys
-owner,me,chans=sys.argv[1:]
+import json,re,sys
+provider,owner,me,chans=sys.argv[1:]
 e=json.load(sys.stdin)
 ch=str(e.get("channel") or "")
-if e.get("provider")!="discord" or e.get("kind")!="message" or not ch.isdigit(): sys.exit()
-if e.get("is_bot") or (me and e.get("user")==me): sys.exit()
+ids={"discord":r"[0-9]+","slack":r"[A-Z0-9]+"}
+if e.get("provider")!=provider or provider not in ids or not re.fullmatch(ids[provider],ch): sys.exit()
+if e.get("kind")!="message" or e.get("is_bot") or (me and e.get("user")==me): sys.exit()
 mine=owner and e.get("user")==owner
 if (mine and (e.get("channel_type")=="dm" or ch in chans.split(","))) or e.get("mentions_self"):
-    print(ch)' "${OWNER_ID:-}" "${SELF_BOT_ID:-}" "${OWNER_CHANNELS:-}" 2>/dev/null
+    print(ch)' "${CHAT_PROVIDER:-none}" "${OWNER_ID:-}" "${SELF_BOT_ID:-}" "${OWNER_CHANNELS:-}" 2>/dev/null
+}
+
+# Tell the sender why no answer is coming yet. Once per channel per episode, so a
+# conversation during a four-hour limit gets one notice, not one per message.
+auto_reply() { # auto_reply <event line> <text> <episode>
+    local chan f
+    chan="$(reply_channel "$1")"
+    [ -n "$chan" ] || return 0
+    f="$STATE/replied-$chan"
+    [ "$(cat "$f" 2>/dev/null)" = "$3" ] && return 0
+    echo "$3" > "$f"
+    AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/notify.sh" "$2" "$chan" >/dev/null 2>&1 &
+    log "auto-replied in $chan ($3)"
+}
+
+# True when claude can't think and the event must wait. At a usage limit a wake
+# would only type into claude's limit menu, so the event stays in the queue and the
+# watchdog wakes the agent after the reset. When requests keep failing, the wake
+# still goes ahead, since it is also the retry.
+held() { # held <event line>
+    local st until detail keys
+    IFS=$'\t' read -r st until detail keys < <(AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/claude-state.sh")
+    if [ "${st:-}" = limited ] && [ "${until:-0}" -gt "$(date +%s)" ]; then
+        local when="as soon as it resets"
+        [ "${detail:--}" = - ] || when="when it resets ($detail)"
+        auto_reply "$1" "⏳ I've hit my Claude usage limit, so I can't work on this yet. I'll pick up your message $when." "limit-$keys"
+        log "held for the usage limit: $(printf '%s' "$1" | cut -c1-100)"
+        return 0
+    fi
+    if [ -f "$DEGRADED" ]; then
+        auto_reply "$1" "⚠️ I'm having trouble reaching Claude ($(sed -n 2p "$DEGRADED")), so my reply may be late. I'll keep retrying." "degraded-$(sed -n 1p "$DEGRADED")"
+    fi
+    return 1
 }
 
 show_typing() { # show_typing <event line>
@@ -473,6 +672,7 @@ log "watching $EVENT_JSONL"
 log "actionable pattern: $PAT"
 tail -n0 -F "$EVENT_JSONL" 2>/dev/null | while IFS= read -r line; do
     printf '%s' "$line" | grep -qE "$PAT" || continue
+    held "$line" && continue
     show_typing "$line"   # before nudge, so a debounced message still shows it
     nudge "$(printf '%s' "$line" | cut -c1-140)"
 done
@@ -488,14 +688,21 @@ cat > "$WORKSPACE/scripts/watchdog.sh" <<'SCRIPT'
 #   2. tmux session missing         -> restart the unit
 #   3. login/auth expired, or the
 #      bypass warning unanswered    -> ALERT (only a human can fix this)
-#   4. pane byte-identical too long -> loop frozen: re-bootstrap, else restart
-#   5. session alive, loop not armed-> re-bootstrap (a bare claude idles forever)
+#   4. claude can't think           -> usage limit: pause, wake after the reset;
+#                                      API errors: wake with backoff, then alert;
+#                                      context full: /compact, then restart
+#   5. pane byte-identical too long -> loop frozen: re-bootstrap, else restart
+#   6. session alive, loop not armed-> re-bootstrap (a bare claude idles forever)
 #
 # Deliberately NOT `set -e`: a failing check must not abort the remaining ones.
 set -uo pipefail
 source "${AGENT_ENV:?AGENT_ENV not set}"
 STATE="${STATE_DIR:-/tmp/$AGENT-state}/watchdog"; mkdir -p "$STATE"
 log() { echo "$(date -u +%FT%TZ) [watchdog:$AGENT] $*"; }
+tell() { # tell <message> — news for the owner that isn't a fault
+    [ -x "$WORKSPACE/scripts/notify.sh" ] && \
+      AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/notify.sh" "$AGENT: $1" || true
+}
 
 alert() { # alert <key> <message> [dedupe-secs] — deduped so we never spam
     local key="$1" msg="$2" dedupe="${3:-1800}" f="$STATE/alert-$1" now
@@ -565,10 +772,91 @@ if printf '%s' "$PANE" | grep -qi 'yes, i accept'; then
     exit 0
 fi
 
-# 4. frozen pane. The threshold MUST exceed the agent's longest idle
+# 4. claude is running but can't think. None of these is fixed by re-pasting the
+# prompt, which the checks below would do: its first step skips the queue backlog,
+# so the messages that arrived meanwhile would never be answered.
+CS="${STATE_DIR:-/tmp/$AGENT-state}/claude"; mkdir -p "$CS"; now="$(date +%s)"
+IFS=$'\t' read -r cstate cuntil cdetail ckeys < <("$WORKSPACE/scripts/claude-state.sh")
+handled() { # this pane's messages are dealt with; claude-state.sh skips them from now on
+    printf '%s\n' "$ckeys" | tr ',' '\n' >> "$CS/handled"
+    tail -n 200 "$CS/handled" > "$CS/handled.tmp" && mv "$CS/handled.tmp" "$CS/handled"
+}
+quiet_since() { # quiet_since <file> — true once the time at the end of <file> is 15 minutes old
+    local t; t="$(awk '{print $NF}' "$1" 2>/dev/null)"
+    [ "$((now - ${t:-0}))" -ge 900 ]
+}
+case "${cstate:-ok}" in
+  limited)
+    # The nudger holds events and replies to their senders until the reset.
+    if [ "$now" -lt "$cuntil" ]; then
+        if [ "$(cat "$CS/limit-alerted" 2>/dev/null)" != "$ckeys" ]; then
+            echo "$ckeys" > "$CS/limit-alerted"
+            when=""; [ "$cdetail" = - ] || when=" (resets $cdetail)"
+            alert usage-limit "hit the Claude usage limit$when. Messages wait in the queue, their senders get an automatic reply, and the agent resumes after the reset" 60
+        fi
+        log "usage limit: paused until $(date -u -d "@$cuntil" +%FT%TZ 2>/dev/null || echo "$cuntil")"
+        exit 0
+    fi
+    # Past the reset. If claude is still limited, it prints a new limit line,
+    # which starts the next pause.
+    if AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/wake.sh"; then
+        handled
+        log "usage limit reset; woke the agent to work through the queue"
+        tell "the usage limit has reset. Catching up on the queue now."
+    else
+        alert limit-menu "the usage limit has reset, but claude's limit menu won't close. A human must run 'tmux attach -t $SESSION' and choose 'Stop and wait for limit to reset'" 3600
+    fi
+    exit 0 ;;
+  api-error)
+    # claude has already retried this request and given up, so wait before asking
+    # again, and wait longer each time.
+    read -r tries _ 2>/dev/null < "$CS/error-tries" || tries=0
+    if [ "$(cut -d' ' -f1 "$CS/error-seen" 2>/dev/null)" != "$ckeys" ]; then
+        echo "$ckeys $now" > "$CS/error-seen"
+    fi
+    seen="$(cut -d' ' -f2 "$CS/error-seen")"
+    wait=$((API_ERROR_WAKE_SECS << (tries < 4 ? tries : 4))); [ "$wait" -le 3600 ] || wait=3600
+    if [ "$((now - seen))" -lt "$wait" ]; then
+        log "claude reported: $cdetail. Waking it in $((wait - (now - seen)))s"
+        exit 0
+    fi
+    tries=$((tries + 1)); echo "$tries $now" > "$CS/error-tries"
+    handled
+    if [ "$tries" -ge "$API_ERROR_ALERT_AFTER" ]; then
+        # The nudger reads this and tells new senders their reply may be late.
+        [ -f "$CS/degraded" ] || printf '%s\n%s\n' "$now" "$cdetail" > "$CS/degraded"
+        alert api-errors "claude's requests keep failing ($tries tries): $cdetail" 3600
+    fi
+    AGENT_ENV="$AGENT_ENV" "$WORKSPACE/scripts/wake.sh" && log "woke claude after an API error (try $tries)"
+    exit 0 ;;
+  context-full)
+    if [ ! -f "$CS/compacted" ]; then
+        handled; echo "$now" > "$CS/compacted"
+        log "context full ($cdetail); compacting"
+        tmux send-keys -t "$SESSION" "/compact"
+        sleep 0.1
+        tmux send-keys -t "$SESSION" Enter
+    else
+        handled; rm -f "$CS/compacted"
+        alert context-full "claude's context is full and /compact didn't fix it ($cdetail). Restarting it: the live conversation is lost, the memory files carry over" 3600
+        restart_guarded || alert context-full-stuck "context full and restart is in cooldown" 3600
+    fi
+    exit 0 ;;
+  *)
+    # A failure is over only after a quiet spell: right after a wake, claude is
+    # still retrying and the pane shows no error yet.
+    if [ -f "$CS/error-tries" ] && quiet_since "$CS/error-tries"; then
+        [ -f "$CS/degraded" ] && tell "claude is answering again."
+        rm -f "$CS/error-tries" "$CS/error-seen" "$CS/degraded"
+    fi
+    [ -f "$CS/compacted" ] && quiet_since "$CS/compacted" && rm -f "$CS/compacted"
+    ;;
+esac
+
+# 5. frozen pane. The threshold MUST exceed the agent's longest idle
 # ScheduleWakeup interval, or a normally-sleeping agent gets restarted.
 HASH="$(printf '%s' "$PANE" | md5sum | cut -d' ' -f1)"
-HF="$STATE/pane-hash"; TF="$STATE/pane-since"; now="$(date +%s)"
+HF="$STATE/pane-hash"; TF="$STATE/pane-since"
 if [ "$(cat "$HF" 2>/dev/null || echo)" = "$HASH" ]; then
     since="$(cat "$TF" 2>/dev/null || echo "$now")"
     if [ "$((now - since))" -ge "$IDLE_STALL_SECS" ]; then
@@ -584,7 +872,7 @@ else
     echo "$HASH" > "$HF"; echo "$now" > "$TF"
 fi
 
-# 5. armed? A restarted session with no prompt is a bare claude that idles
+# 6. armed? A restarted session with no prompt is a bare claude that idles
 # forever while every instrument reports it healthy.
 # A session younger than the runner's auto-paste delay is booting, not un-armed:
 # pasting now means the prompt lands in the splash and then arrives a second time.
@@ -634,7 +922,7 @@ case "\${1:-attach}" in
 esac
 EOF
 chmod 0755 "$BIN/$AGENT-bootstrap" "$BIN/$AGENT-attach"
-chmod 0755 "$WORKSPACE/scripts"/{claude.sh,run.sh,nudger.sh,watchdog.sh,notify.sh,typing.sh}
+chmod 0755 "$WORKSPACE/scripts"/{claude.sh,run.sh,nudger.sh,watchdog.sh,notify.sh,typing.sh,claude-state.sh,wake.sh}
 
 # ── 9. the signal filter (provider-agnostic; works on the normalized envelope)
 say "writing scripts/signal-filter.py"
